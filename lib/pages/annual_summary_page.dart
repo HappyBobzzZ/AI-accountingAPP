@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models/bill.dart';
 import '../services/app_events.dart';
 import '../services/database_service.dart';
+import '../services/privacy_controller.dart';
 import '../theme/app_theme.dart';
 import '../theme/category_style.dart';
 import '../widgets/app_widgets.dart';
@@ -94,69 +95,78 @@ class _AnnualSummaryPageState extends State<AnnualSummaryPage> {
     final expense = (_data?['totalExpense'] as double?) ?? 0;
     final balance = income - expense;
 
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(AppRadius.xl),
-      child: Container(
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [Color(0xFF3A55E0), Color(0xFF6C86FF)],
-          ),
-        ),
-        child: Stack(
-          children: [
-            Positioned(
-              right: -30,
-              top: -40,
-              child: Container(
-                width: 140,
-                height: 140,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: Colors.white.withValues(alpha: 0.07),
-                ),
+    return AnimatedBuilder(
+      animation: PrivacyController.instance,
+      builder: (context, _) {
+        final visible = PrivacyController.instance.amountVisible;
+
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(AppRadius.xl),
+          child: Container(
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [Color(0xFF3A55E0), Color(0xFF6C86FF)],
               ),
             ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(
-                  AppGap.xl, AppGap.lg, AppGap.xl, AppGap.lg),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '$_year 年总支出',
-                    style: const TextStyle(
-                        fontSize: 13, color: Color(0xCCFFFFFF)),
-                  ),
-                  const SizedBox(height: 6),
-                  FittedBox(
-                    fit: BoxFit.scaleDown,
-                    alignment: Alignment.centerLeft,
-                    child: Text(
-                      '¥${formatMoney(expense)}',
-                      style: moneyStyle(
-                          size: 32, color: Colors.white, letterSpacing: -0.8),
+            child: Stack(
+              children: [
+                Positioned(
+                  right: -30,
+                  top: -40,
+                  child: Container(
+                    width: 140,
+                    height: 140,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: Colors.white.withValues(alpha: 0.07),
                     ),
                   ),
-                  const SizedBox(height: AppGap.lg),
-                  Row(
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(
+                      AppGap.xl, AppGap.lg, AppGap.xl, AppGap.lg),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      _miniStat('总收入', income),
-                      const SizedBox(width: AppGap.xl),
-                      _miniStat('结余', balance),
+                      Text(
+                        '$_year 年总支出',
+                        style: const TextStyle(
+                            fontSize: 13, color: Color(0xCCFFFFFF)),
+                      ),
+                      const SizedBox(height: 6),
+                      FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          moneyDisplay(expense, visible: visible),
+                          style: moneyStyle(
+                              size: 32,
+                              color: Colors.white,
+                              letterSpacing: -0.8),
+                        ),
+                      ),
+                      const SizedBox(height: AppGap.lg),
+                      Row(
+                        children: [
+                          _miniStat('总收入', income, visible),
+                          const SizedBox(width: AppGap.xl),
+                          _miniStat('结余', balance, visible),
+                        ],
+                      ),
                     ],
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 
-  Widget _miniStat(String label, double value) {
+  Widget _miniStat(String label, double value, bool visible) {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -164,7 +174,7 @@ class _AnnualSummaryPageState extends State<AnnualSummaryPage> {
             style: const TextStyle(fontSize: 12.5, color: Color(0xB3FFFFFF))),
         const SizedBox(width: 6),
         Text(
-          '¥${formatMoney(value)}',
+          moneyDisplay(value, visible: visible),
           style: moneyStyle(
               size: 14, color: Colors.white, weight: FontWeight.w600),
         ),
@@ -285,19 +295,48 @@ class _AnnualSummaryPageState extends State<AnnualSummaryPage> {
                   ),
           ),
           const SizedBox(width: AppGap.md),
+          // 收入和支出都显示：只看支出看不出"这个月其实有进账"
           SizedBox(
-            width: 66,
-            child: Text(
-              hasData ? '¥${formatMoney(expense, decimals: 0)}' : '—',
-              textAlign: TextAlign.right,
-              style: TextStyle(
-                fontSize: 11.5,
-                color: hasData ? palette.textSecondary : palette.textTertiary,
-                fontFeatures: const [FontFeature.tabularFigures()],
-              ),
-            ),
+            width: 96,
+            height: 32,
+            child: hasData
+                ? Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      if (expense > 0)
+                        _amountLine('支出', expense, palette.expense),
+                      if (income > 0)
+                        _amountLine('收入', income, palette.income),
+                    ],
+                  )
+                : Align(
+                    alignment: Alignment.centerRight,
+                    child: Text(
+                      '—',
+                      style: TextStyle(
+                          fontSize: 11.5, color: palette.textTertiary),
+                    ),
+                  ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _amountLine(String label, double value, Color color) {
+    return FittedBox(
+      fit: BoxFit.scaleDown,
+      alignment: Alignment.centerRight,
+      child: Text(
+        '$label ¥${formatMoney(value, decimals: 0)}',
+        style: TextStyle(
+          fontSize: 10.5,
+          height: 1.3,
+          color: color,
+          fontWeight: FontWeight.w600,
+          fontFeatures: const [FontFeature.tabularFigures()],
+        ),
       ),
     );
   }

@@ -6,6 +6,7 @@ import '../services/app_events.dart';
 import '../services/data_ops.dart';
 import '../services/database_service.dart';
 import '../services/error_reporter.dart';
+import '../services/privacy_controller.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_widgets.dart';
 import '../widgets/bill_edit_sheet.dart';
@@ -196,36 +197,45 @@ class _BillListPageState extends State<BillListPage> {
     final palette = context.palette;
     final balance = income - expense;
 
-    Widget column(String label, String value, Color color) {
-      return Expanded(
-        child: Column(
-          children: [
-            Text(label,
-                style: TextStyle(fontSize: 12, color: palette.textTertiary)),
-            const SizedBox(height: 6),
-            FittedBox(
-              fit: BoxFit.scaleDown,
-              child: Text(value,
-                  style: moneyStyle(size: 18, color: color)),
-            ),
-          ],
-        ),
-      );
-    }
+    return AnimatedBuilder(
+      animation: PrivacyController.instance,
+      builder: (context, _) {
+        final visible = PrivacyController.instance.amountVisible;
+        final balanceText = visible
+            ? '${balance < 0 ? '-' : ''}¥${formatMoney(balance.abs())}'
+            : '¥ ••••';
 
-    return AppCard(
-      padding: const EdgeInsets.symmetric(vertical: AppGap.lg),
-      child: Row(
-        children: [
-          column('支出', '¥${formatMoney(expense)}', palette.expense),
-          column('收入', '¥${formatMoney(income)}', palette.income),
-          column(
-            '结余',
-            '${balance < 0 ? '-' : ''}¥${formatMoney(balance.abs())}',
-            Theme.of(context).colorScheme.onSurface,
+        Widget column(String label, String value, Color color) {
+          return Expanded(
+            child: Column(
+              children: [
+                Text(label,
+                    style:
+                        TextStyle(fontSize: 12, color: palette.textTertiary)),
+                const SizedBox(height: 6),
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(value, style: moneyStyle(size: 18, color: color)),
+                ),
+              ],
+            ),
+          );
+        }
+
+        return AppCard(
+          padding: const EdgeInsets.symmetric(vertical: AppGap.lg),
+          child: Row(
+            children: [
+              column('支出', moneyDisplay(expense, visible: visible),
+                  palette.expense),
+              column('收入', moneyDisplay(income, visible: visible),
+                  palette.income),
+              column('结余', balanceText,
+                  Theme.of(context).colorScheme.onSurface),
+            ],
           ),
-        ],
-      ),
+        );
+      },
     );
   }
 

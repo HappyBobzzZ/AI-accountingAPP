@@ -2,11 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:intl/date_symbol_data_local.dart';
 import 'pages/main_shell.dart';
+import 'services/privacy_controller.dart';
 import 'theme/app_theme.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   initializeDateFormatting('zh_CN');
+  // 金额隐私开关：默认隐藏，读一次本地偏好（读不到就按默认值）
+  PrivacyController.instance.load();
   ErrorWidget.builder = (details) {
     return Material(
       child: Center(

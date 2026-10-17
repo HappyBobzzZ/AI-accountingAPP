@@ -24,6 +24,17 @@ String formatMoney(num value, {int decimals = 2, bool grouped = true}) {
   return '${negative ? '-' : ''}$buffer$decPart';
 }
 
+/// 带隐私遮罩的金额文本
+///
+/// 不可见时用固定长度的圆点，不按位数变化 —— 否则位数本身
+/// 也会泄露"这个月花了几千还是几万"。
+String moneyDisplay(
+  num value, {
+  required bool visible,
+  int decimals = 2,
+}) =>
+    visible ? '¥${formatMoney(value, decimals: decimals)}' : '¥ ••••';
+
 /// ── 卡片 ──────────────────────────────────────────────
 ///
 /// 浅灰底 + 纯白卡，靠对比而不是阴影分层（阴影堆多了会发灰）。

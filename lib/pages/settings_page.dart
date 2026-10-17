@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../services/api_service.dart';
 import '../services/asr_model_controller.dart';
 import '../services/data_ops.dart';
+import '../services/privacy_controller.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_widgets.dart';
 
@@ -17,6 +18,7 @@ class SettingsPage extends StatefulWidget {
 
 class _SettingsPageState extends State<SettingsPage> {
   final _model = AsrModelController.instance;
+  final _privacy = PrivacyController.instance;
 
   bool _serverChecked = false;
   bool _serverAvailable = false;
@@ -25,6 +27,7 @@ class _SettingsPageState extends State<SettingsPage> {
   void initState() {
     super.initState();
     _model.addListener(_onModelChanged);
+    _privacy.addListener(_onModelChanged);
     _model.ensureChecked();
     _checkServer();
   }
@@ -32,6 +35,7 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void dispose() {
     _model.removeListener(_onModelChanged);
+    _privacy.removeListener(_onModelChanged);
     super.dispose();
   }
 
@@ -111,13 +115,15 @@ class _SettingsPageState extends State<SettingsPage> {
 
           _group('语音识别', [_buildModelRow()]),
 
+          _group('隐私', [_buildPrivacyRow()]),
+
           _group('解析引擎', [_buildEngineRow()]),
 
           _group('关于', [
             _Row(
               icon: Icons.info_outline_rounded,
               title: '版本',
-              subtitle: '1.4.0（2008）',
+              subtitle: '1.4.1（2009）',
             ),
             _divider(),
             _Row(
@@ -175,6 +181,25 @@ class _SettingsPageState extends State<SettingsPage> {
           ? null
           : (_model.ready ? null : _downloadModel),
       progress: _model.downloading ? _model.progress : null,
+    );
+  }
+
+  Widget _buildPrivacyRow() {
+    final visible = _privacy.amountVisible;
+
+    return _Row(
+      icon: visible
+          ? Icons.visibility_rounded
+          : Icons.visibility_off_rounded,
+      title: '显示金额',
+      subtitle: visible
+          ? '首页、账单、统计的汇总金额直接显示'
+          : '汇总金额显示为 ¥ ••••，避免旁人一眼看到；点首页卡片上的眼睛可临时显示',
+      trailing: Switch.adaptive(
+        value: visible,
+        onChanged: (v) => _privacy.setVisible(v),
+      ),
+      onTap: () => _privacy.setVisible(!visible),
     );
   }
 

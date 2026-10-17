@@ -19,6 +19,7 @@ import '../services/database_service.dart';
 import '../services/error_reporter.dart';
 import '../services/haptics.dart';
 import '../services/offline_asr_service.dart';
+import '../services/privacy_controller.dart';
 import '../services/voice_activity.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_widgets.dart';
@@ -552,70 +553,129 @@ class _HomePageState extends State<HomePage> {
   }
 
   /// 本月概览：让首页一眼看到"这个月花了多少"
+  ///
+  /// 金额默认遮起来（旁边有人瞄一眼就全看见了），点眼睛才显示；
+  /// 整张卡可点，进入账单页看明细。
   Widget _buildOverviewCard() {
-    final monthLabel = DateFormat('M月').format(DateTime.now());
-    final balance = _monthIncome - _monthExpense;
+    return AnimatedBuilder(
+      animation: PrivacyController.instance,
+      builder: (context, _) {
+        final visible = PrivacyController.instance.amountVisible;
+        final monthLabel = DateFormat('M月').format(DateTime.now());
+        final balance = _monthIncome - _monthExpense;
 
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(AppRadius.xl),
-      child: Container(
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [Color(0xFF3A55E0), Color(0xFF6C86FF)],
-          ),
-        ),
-        child: Stack(
-          children: [
-            // 右上角一枚很淡的装饰圆，避免大色块显得死板
-            Positioned(
-              right: -30,
-              top: -40,
-              child: Container(
-                width: 140,
-                height: 140,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: Colors.white.withValues(alpha: 0.07),
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(AppRadius.xl),
+          child: Material(
+            color: Colors.transparent,
+            child: Ink(
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [Color(0xFF3A55E0), Color(0xFF6C86FF)],
+                ),
+              ),
+              child: InkWell(
+                onTap: () => AppEvents.instance.switchTab(1),
+                child: Stack(
+                  children: [
+                    // 右上角一枚很淡的装饰圆，避免大色块显得死板
+                    Positioned(
+                      right: -30,
+                      top: -40,
+                      child: Container(
+                        width: 140,
+                        height: 140,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: Colors.white.withValues(alpha: 0.07),
+                        ),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(
+                          AppGap.xl, AppGap.lg, AppGap.lg, AppGap.lg),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Text(
+                                '$monthLabel支出',
+                                style: const TextStyle(
+                                    fontSize: 13, color: Color(0xCCFFFFFF)),
+                              ),
+                              const Spacer(),
+                              _buildEyeButton(visible),
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            moneyDisplay(_monthExpense, visible: visible),
+                            style: moneyStyle(
+                                size: 34,
+                                color: Colors.white,
+                                letterSpacing: -0.8),
+                          ),
+                          const SizedBox(height: AppGap.lg),
+                          Row(
+                            children: [
+                              _miniStat('收入', _monthIncome, visible),
+                              const SizedBox(width: AppGap.xl),
+                              _miniStat('结余', balance, visible),
+                            ],
+                          ),
+                          const SizedBox(height: AppGap.md),
+                          // 明确告诉用户这张卡可以点
+                          Row(
+                            children: [
+                              Text(
+                                '查看账单明细',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.white.withValues(alpha: 0.75),
+                                ),
+                              ),
+                              Icon(Icons.chevron_right_rounded,
+                                  size: 15,
+                                  color: Colors.white.withValues(alpha: 0.75)),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(
-                  AppGap.xl, AppGap.lg, AppGap.xl, AppGap.lg),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '$monthLabel支出',
-                    style: const TextStyle(
-                        fontSize: 13, color: Color(0xCCFFFFFF)),
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    '¥${formatMoney(_monthExpense)}',
-                    style: moneyStyle(
-                        size: 34, color: Colors.white, letterSpacing: -0.8),
-                  ),
-                  const SizedBox(height: AppGap.lg),
-                  Row(
-                    children: [
-                      _miniStat('收入', _monthIncome),
-                      const SizedBox(width: AppGap.xl),
-                      _miniStat('结余', balance),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildEyeButton(bool visible) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => PrivacyController.instance.toggle(),
+      child: Container(
+        width: 34,
+        height: 34,
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.16),
+          shape: BoxShape.circle,
+        ),
+        child: Icon(
+          visible ? Icons.visibility_rounded : Icons.visibility_off_rounded,
+          size: 17,
+          color: Colors.white,
         ),
       ),
     );
   }
 
-  Widget _miniStat(String label, double value) {
+  Widget _miniStat(String label, double value, bool visible) {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -623,7 +683,7 @@ class _HomePageState extends State<HomePage> {
             style: const TextStyle(fontSize: 12.5, color: Color(0xB3FFFFFF))),
         const SizedBox(width: 6),
         Text(
-          '¥${formatMoney(value)}',
+          moneyDisplay(value, visible: visible),
           style: moneyStyle(
               size: 14, color: Colors.white, weight: FontWeight.w600),
         ),

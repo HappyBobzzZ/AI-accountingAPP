@@ -256,4 +256,14 @@ class DatabaseService {
     );
     return results.map((row) => Bill.fromJson(row)).toList();
   }
+
+  /// 获取全部账单（导出备份用，按日期正序，便于在表格里阅读）
+  Future<List<Bill>> getAllBills() async {
+    final db = await database;
+    final results = await db.query(
+      'bills',
+      orderBy: 'date ASC, created_at ASC',
+    );
+    return results.map((row) => Bill.fromJson(row)).toList();
+  }
 }

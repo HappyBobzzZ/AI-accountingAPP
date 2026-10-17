@@ -3,6 +3,7 @@ import 'package:intl/intl.dart';
 import '../models/bill.dart';
 import '../services/database_service.dart';
 import '../services/error_reporter.dart';
+import '../services/export_service.dart';
 import '../widgets/bill_edit_sheet.dart';
 import 'annual_summary_page.dart';
 
@@ -19,6 +20,7 @@ class _BillListPageState extends State<BillListPage> {
   List<Bill> _bills = [];
   Map<String, double> _summary = {'收入': 0, '支出': 0};
   bool _loading = true;
+  bool _exporting = false;
 
   @override
   void initState() {
@@ -100,6 +102,62 @@ class _BillListPageState extends State<BillListPage> {
     }
   }
 
+  /// 导出全部账单为 CSV，再交给系统分享面板
+  Future<void> _exportBills() async {
+    if (_exporting) return;
+
+    final bills = await DatabaseService.instance.getAllBills();
+    if (!mounted) return;
+    if (bills.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('还没有账单可以导出')),
+      );
+      return;
+    }
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('导出账单备份'),
+        content: Text(
+          '将把全部 ${bills.length} 条账单导出为 CSV 文件，'
+          '可用 Excel / WPS 打开。\n\n'
+          '点"导出"后会弹出分享面板，可保存到文件管理器、'
+          '发到微信或邮箱。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('导出'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+
+    setState(() => _exporting = true);
+    try {
+      // iPad/Mac 需要锚点，安卓忽略
+      final box = context.findRenderObject() as RenderBox?;
+      final origin =
+          box == null ? null : box.localToGlobal(Offset.zero) & box.size;
+      await ExportService.shareCsv(bills, sharePositionOrigin: origin);
+    } catch (e, st) {
+      ErrorReporter.report('export_csv', e, st);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('导出失败: $e'), backgroundColor: Colors.red),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _exporting = false);
+    }
+  }
+
   /// 点击账单 → 弹出编辑弹窗，保存后刷新列表
   Future<void> _editBill(Bill bill) async {
     if (bill.id == null) return;
@@ -135,6 +193,17 @@ class _BillListPageState extends State<BillListPage> {
       appBar: AppBar(
         title: const Text('账单列表'),
         actions: [
+          IconButton(
+            icon: _exporting
+                ? const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.ios_share),
+            tooltip: '导出账单备份',
+            onPressed: _exporting ? null : _exportBills,
+          ),
           IconButton(
             icon: const Icon(Icons.calendar_view_month),
             tooltip: '年度汇总',

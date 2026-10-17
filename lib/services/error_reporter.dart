@@ -1,10 +1,11 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import '../config.dart';
 
-/// 异常上报 — 把手机端异常 POST 回电脑端服务器（排查 HarmonyOS 真机错误）
+/// 异常上报 — 把手机端异常 POST 回电脑端服务器（排查真机错误）
 /// fire-and-forget，绝不抛出、绝不影响主流程
 class ErrorReporter {
-  static const String _endpoint = 'http://192.168.2.146:8000/api/log';
+  static String get _endpoint => '${AppConfig.apiBase}/api/log';
 
   static void report(String source, Object error, StackTrace stack) {
     try {

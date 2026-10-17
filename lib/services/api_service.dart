@@ -1,13 +1,14 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
+import '../config.dart';
 import '../models/bill.dart';
 import 'local_parser_service.dart';
 
 /// API 服务 — 优先连接 PC 后端，不可达时自动使用本地引擎
 class ApiService {
-  // 电脑局域网 IP（手机和电脑需在同一网络）
-  static const String baseUrl = 'http://192.168.2.146:8000';
+  /// 电脑局域网地址（在 lib/config.dart 里改，或用 --dart-define 覆盖）
+  static String get baseUrl => AppConfig.apiBase;
 
   /// 上次连接状态（用于 UI 提示）
   static bool lastUsedRemote = false;

@@ -23,6 +23,24 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // 只保留 arm64：sherpa-onnx / onnxruntime 的 native 库会把三套 ABI
+        // 全打进来（约 74MB），过滤后 APK 直接减半
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    // 第三方 AAR（onnxruntime）会带上 x86/x86_64/armv7 的 .so，
+    // ndk.abiFilters 管不到它们，必须在打包阶段排除
+    packaging {
+        jniLibs {
+            excludes += listOf(
+                "lib/x86/**",
+                "lib/x86_64/**",
+                "lib/armeabi-v7a/**",
+            )
+        }
     }
 
     buildTypes {

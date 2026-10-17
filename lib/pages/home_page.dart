@@ -1,14 +1,20 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:record/record.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 // 7.5.0 主入口未导出这两个类型，从包内公开子库导入
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import '../models/bill.dart';
 import '../services/api_service.dart';
+import '../services/asr_model.dart';
 import '../services/bill_import.dart';
 import '../services/database_service.dart';
 import '../services/error_reporter.dart';
+import '../services/offline_asr_service.dart';
 import '../widgets/bill_edit_sheet.dart';
 import 'bill_list_page.dart';
 import 'manual_entry_page.dart';
@@ -29,11 +35,19 @@ class _HomePageState extends State<HomePage> {
   bool _serverChecked = false;
   List<Bill> _recentBills = [];
 
-  // ── 语音输入（系统识别引擎） ─────────────────────────
+  // ── 语音输入（离线识别为主，系统识别兜底） ─────────────
   final SpeechToText _speech = SpeechToText();
   bool _speechReady = false; // 系统语音识别是否可用（华为上需实测）
-  bool _listening = false;
+  bool _listening = false;   // 系统识别中
   String _voiceText = '';
+
+  final AudioRecorder _recorder = AudioRecorder();
+  bool _recording = false;      // 长按录音中
+  bool _transcribing = false;   // 离线识别中
+  String? _voiceFile;           // 本次录音的临时 wav
+
+  bool _downloadingModel = false;
+  double _modelProgress = 0;
 
   @override
   void initState() {
@@ -78,7 +92,224 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /// 点麦克风开始/停止听写；识别完成后自动走 AI 识别流程
+  // ── 离线识别：长按说话 ───────────────────────────────
+
+  /// 长按麦克风 → 开始录音（先确保模型已下载）
+  Future<void> _startVoiceHold() async {
+    if (_isProcessing || _recording || _transcribing || _downloadingModel) {
+      return;
+    }
+
+    // 1. 麦克风权限（点按才请求，不在启动时打扰）
+    var perm = await Permission.microphone.status;
+    if (perm.isDenied) perm = await Permission.microphone.request();
+    if (!perm.isGranted) {
+      if (perm.isPermanentlyDenied) openAppSettings();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('需要麦克风权限才能语音输入，请在设置中允许'),
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+      return;
+    }
+
+    // 2. 模型没装就引导下载（只需一次，之后完全离线）
+    if (!await AsrModelManager.isReady()) {
+      if (!mounted) return;
+      await _promptDownloadModel();
+      if (!mounted) return;
+      if (!await AsrModelManager.isReady()) return;
+    }
+
+    // 3. 录音：16k 单声道 WAV，识别引擎直接吃这个格式
+    try {
+      final dir = await getTemporaryDirectory();
+      _voiceFile =
+          '${dir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.wav';
+      await _recorder.start(
+        const RecordConfig(
+          encoder: AudioEncoder.wav,
+          sampleRate: 16000,
+          numChannels: 1,
+        ),
+        path: _voiceFile!,
+      );
+      if (mounted) {
+        setState(() {
+          _recording = true;
+          _voiceText = '';
+        });
+      }
+    } catch (e, st) {
+      ErrorReporter.report('voice_record_start', e, st);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('录音启动失败: $e')),
+        );
+      }
+    }
+  }
+
+  /// 松手 → 结束录音 → 离线识别 → 回填输入框并解析
+  Future<void> _stopVoiceHold() async {
+    if (!_recording) return;
+    setState(() {
+      _recording = false;
+      _transcribing = true;
+    });
+
+    String? path;
+    try {
+      path = await _recorder.stop();
+    } catch (e, st) {
+      ErrorReporter.report('voice_record_stop', e, st);
+    }
+
+    if (path == null || !File(path).existsSync()) {
+      if (mounted) setState(() => _transcribing = false);
+      return;
+    }
+
+    try {
+      final text = await OfflineAsrService.transcribe(path);
+      if (!mounted) return;
+      setState(() => _transcribing = false);
+
+      if (text.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('没听清，长按麦克风再说一次'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+        return;
+      }
+
+      // 回填输入框，让用户能看到"听到了什么"，再走解析
+      _textController.text = text;
+      _textController.selection =
+          TextSelection.collapsed(offset: text.length);
+      _sendToAI(text);
+    } catch (e, st) {
+      ErrorReporter.report('voice_transcribe', e, st);
+      if (mounted) {
+        setState(() => _transcribing = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('识别失败: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } finally {
+      // 临时录音文件用完即删，避免堆积
+      try {
+        final f = File(path);
+        if (await f.exists()) await f.delete();
+      } catch (_) {}
+    }
+  }
+
+  /// 模型未就绪时的引导：下载 / 先用系统识别 / 取消
+  Future<void> _promptDownloadModel() async {
+    final model = AsrModel.defaultModel;
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('需要先下载语音模型'),
+        content: Text(
+          '离线识别要在手机上装一个中文语音模型'
+          '（${model.label}，约 ${model.totalMb} MB）。\n\n'
+          '只需下载一次，之后完全离线：不联网、不上传录音，'
+          '在外面没 WiFi 也能用。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'cancel'),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'system'),
+            child: const Text('先用系统识别'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, 'download'),
+            child: const Text('下载'),
+          ),
+        ],
+      ),
+    );
+
+    if (!mounted) return;
+    if (choice == 'download') {
+      await _downloadModel();
+    } else if (choice == 'system') {
+      await _toggleVoice();
+    }
+  }
+
+  /// 下载模型，进度显示在页面顶部状态条里
+  Future<void> _downloadModel() async {
+    if (_downloadingModel) return;
+    setState(() {
+      _downloadingModel = true;
+      _modelProgress = 0;
+    });
+
+    try {
+      var lastShown = 0.0;
+      final ok = await AsrModelManager.download(
+        onProgress: (received, total) {
+          if (!mounted || total <= 0) return;
+          final p = received / total;
+          // 每 1% 才刷新一次，避免频繁 setState
+          if (p - lastShown >= 0.01 || p >= 1) {
+            lastShown = p;
+            setState(() => _modelProgress = p);
+          }
+        },
+      );
+      if (!mounted) return;
+      setState(() => _downloadingModel = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(ok ? '✅ 语音模型已就绪，长按麦克风试试' : '下载未完成，请重试'),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    } catch (e, st) {
+      ErrorReporter.report('asr_model_download', e, st);
+      if (!mounted) return;
+      setState(() => _downloadingModel = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('模型下载失败: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  /// 语音状态条文案
+  String _voiceStatusText() {
+    if (_downloadingModel) {
+      final pct = (_modelProgress * 100).toStringAsFixed(0);
+      return '正在下载语音模型 $pct%（仅需一次，之后完全离线）';
+    }
+    if (_transcribing) return '正在识别…';
+    if (_recording) return '正在聆听…松手结束';
+    if (_listening) {
+      return _voiceText.isEmpty
+          ? '正在聆听…说完停顿一下，或再点麦克风结束'
+          : _voiceText;
+    }
+    return '';
+  }
+
+  /// 点麦克风开始/停止听写（系统识别，仅在模型未下载时作为兜底）
   Future<void> _toggleVoice() async {
     if (_listening) {
       await _speech.stop(); // stop 会触发 finalResult
@@ -169,6 +400,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void dispose() {
     _speech.cancel(); // 页面销毁时结束识别会话
+    _recorder.dispose();
     _textController.dispose();
     _textFocus.dispose();
     super.dispose();
@@ -436,16 +668,30 @@ class _HomePageState extends State<HomePage> {
                         suffixIcon: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            // 麦克风：点按后按需请求权限并初始化识别
-                            IconButton(
-                              icon: Icon(
-                                  _listening ? Icons.stop : Icons.mic,
-                                  size: 22),
-                              color: _listening
-                                  ? Colors.red
-                                  : Colors.grey.shade600,
-                              tooltip: _listening ? '停止' : '语音输入',
-                              onPressed: _isProcessing ? null : _toggleVoice,
+                            // 麦克风：长按说话、松手结束（微信式）
+                            GestureDetector(
+                              onLongPressStart: (_) => _startVoiceHold(),
+                              onLongPressEnd: (_) => _stopVoiceHold(),
+                              child: Tooltip(
+                                message: _recording ? '松手结束' : '长按说话',
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 10, vertical: 10),
+                                  child: Icon(
+                                    _recording
+                                        ? Icons.mic
+                                        : (_transcribing
+                                            ? Icons.graphic_eq
+                                            : Icons.mic_none),
+                                    size: 22,
+                                    color: _recording
+                                        ? Colors.red
+                                        : (_transcribing
+                                            ? Colors.blue
+                                            : Colors.grey.shade600),
+                                  ),
+                                ),
+                              ),
                             ),
                             IconButton(
                               icon: const Icon(Icons.clear, size: 20),
@@ -464,32 +710,64 @@ class _HomePageState extends State<HomePage> {
                             horizontal: 16, vertical: 14),
                       ),
                     ),
-                    // 聆听状态条（实时显示识别文字）
-                    if (_listening) ...[
+                    // 语音状态条：录音中 / 识别中 / 下载模型中
+                    if (_recording || _transcribing || _listening ||
+                        _downloadingModel) ...[
                       const SizedBox(height: 10),
                       Container(
                         width: double.infinity,
                         padding: const EdgeInsets.symmetric(
                             horizontal: 12, vertical: 10),
                         decoration: BoxDecoration(
-                          color: Colors.red.shade50,
+                          color: _downloadingModel
+                              ? Colors.blue.shade50
+                              : Colors.red.shade50,
                           borderRadius: BorderRadius.circular(10),
                         ),
-                        child: Row(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            const Icon(Icons.mic, size: 16, color: Colors.red),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                _voiceText.isEmpty
-                                    ? '正在聆听…说完停顿一下，或再点麦克风结束'
-                                    : _voiceText,
-                                style: TextStyle(
-                                    fontSize: 13, color: Colors.red.shade700),
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                              ),
+                            Row(
+                              children: [
+                                Icon(
+                                  _downloadingModel
+                                      ? Icons.cloud_download
+                                      : (_transcribing
+                                          ? Icons.graphic_eq
+                                          : Icons.mic),
+                                  size: 16,
+                                  color: _downloadingModel
+                                      ? Colors.blue.shade700
+                                      : Colors.red,
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    _voiceStatusText(),
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      color: _downloadingModel
+                                          ? Colors.blue.shade700
+                                          : Colors.red.shade700,
+                                    ),
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              ],
                             ),
+                            if (_downloadingModel) ...[
+                              const SizedBox(height: 8),
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(3),
+                                child: LinearProgressIndicator(
+                                  value: _modelProgress,
+                                  minHeight: 5,
+                                  backgroundColor: Colors.white,
+                                  color: Colors.blue,
+                                ),
+                              ),
+                            ],
                           ],
                         ),
                       ),

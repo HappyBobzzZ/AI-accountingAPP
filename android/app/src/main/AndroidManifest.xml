@@ -2,6 +2,9 @@
     <!-- 联网权限：发布版必须显式声明，否则所有网络请求被系统直接拒绝 -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <!-- 普通权限，安装即授予；长按录音的触感反馈要用（Flutter 自带 HapticFeedback
+         在部分华为/鸿蒙机型上不生效，改走原生 Vibrator） -->
+    <uses-permission android:name="android.permission.VIBRATE"/>
     <application
         android:label="AI 记账"
         android:name="${applicationName}"

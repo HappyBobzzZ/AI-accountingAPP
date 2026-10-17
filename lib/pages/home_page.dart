@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
@@ -16,7 +15,9 @@ import '../services/asr_model.dart';
 import '../services/bill_import.dart';
 import '../services/database_service.dart';
 import '../services/error_reporter.dart';
+import '../services/haptics.dart';
 import '../services/offline_asr_service.dart';
+import '../services/voice_activity.dart';
 import '../widgets/bill_edit_sheet.dart';
 import 'bill_list_page.dart';
 import 'manual_entry_page.dart';
@@ -47,6 +48,11 @@ class _HomePageState extends State<HomePage> {
   bool _recording = false;      // 长按录音中
   bool _transcribing = false;   // 离线识别中
   String? _voiceFile;           // 本次录音的临时 wav
+
+  // 录音期间的实时音量（让用户看到麦克风确实在收音，太小声也有提示）
+  StreamSubscription<Amplitude>? _ampSub;
+  double _level = 0;          // 归一化到 0~1
+  bool _ampReceived = false;  // 是否收到过音量事件（部分机型不支持）
 
   // 长按判定：用 Listener 直接收原始触摸事件，不参与手势竞争
   // （TextField 的后缀区会被输入框的选中手势抢走，Tooltip 也会抢长按）
@@ -122,7 +128,9 @@ class _HomePageState extends State<HomePage> {
     _holdTimer?.cancel();
     _holdTimer = Timer(const Duration(milliseconds: 350), () {
       if (!_pointerDown) return;
-      HapticFeedback.mediumImpact();
+      // 走原生振动器：Flutter 的 HapticFeedback 在部分华为/鸿蒙机型上被
+      // 系统触感开关静默吞掉，长按完全没反馈
+      unawaited(Haptics.tap());
       if (mounted) setState(() => _holdConfirmed = true);
     });
     unawaited(_beginRecording());
@@ -206,6 +214,7 @@ class _HomePageState extends State<HomePage> {
           _recording = true;
           _voiceText = '';
         });
+        _startLevelMeter();
       }
     } catch (e, st) {
       ErrorReporter.report('voice_record_start', e, st);
@@ -220,6 +229,7 @@ class _HomePageState extends State<HomePage> {
   /// 短按误触：停掉录音并删掉临时文件
   Future<void> _discardRecording() async {
     if (!_recording && _voiceFile == null) return;
+    _stopLevelMeter();
     try {
       await _recorder.stop();
     } catch (_) {}
@@ -233,9 +243,38 @@ class _HomePageState extends State<HomePage> {
     _voiceFile = null;
   }
 
+  /// 录音期间监听音量，驱动状态条上的音量条
+  void _startLevelMeter() {
+    _ampSub?.cancel();
+    _ampReceived = false;
+    _level = 0;
+    _ampSub = _recorder
+        .onAmplitudeChanged(const Duration(milliseconds: 120))
+        .listen((amp) {
+      if (!mounted) return;
+      // amp.current 是 dBFS（约 -160 ~ 0），-50dB 以下当静音
+      final norm = ((amp.current + 50) / 50).clamp(0.0, 1.0);
+      _ampReceived = true;
+      // 变化不到 4% 不刷新，避免高频 setState
+      if ((norm - _level).abs() < 0.04) return;
+      setState(() => _level = norm);
+    }, onError: (_) {
+      // 个别机型拿不到实时音量：不显示音量条即可，不影响录音
+      _ampReceived = false;
+    });
+  }
+
+  void _stopLevelMeter() {
+    _ampSub?.cancel();
+    _ampSub = null;
+    _ampReceived = false;
+    _level = 0;
+  }
+
   /// 松手 → 结束录音 → 离线识别 → 回填输入框并解析
   Future<void> _stopVoiceHold() async {
     if (!_recording) return;
+    _stopLevelMeter();
     setState(() {
       _recording = false;
       _transcribing = true;
@@ -254,6 +293,29 @@ class _HomePageState extends State<HomePage> {
     }
 
     try {
+      // 先判断这段录音里到底有没有人声。
+      // 纯静音/环境噪声喂给 Paraformer 不会返回空串，而是"脑补"出一段
+      // 莫名其妙的话（幻听），所以在这里直接拦掉，不浪费一次推理。
+      final activity = await VoiceDetector.analyzeFile(path);
+      if (activity != null && !activity.hasSpeech) {
+        debugPrint('[VAD] 未检测到人声 '
+            'dur=${activity.durationSec.toStringAsFixed(2)}s '
+            'peak=${activity.peakDbfs.toStringAsFixed(1)}dB '
+            'noise=${activity.noiseDbfs.toStringAsFixed(1)}dB '
+            'thr=${activity.thresholdDbfs.toStringAsFixed(1)}dB '
+            'voiced=${(activity.voicedRatio * 100).toStringAsFixed(1)}%');
+        if (mounted) {
+          setState(() => _transcribing = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(activity.hint),
+              duration: const Duration(seconds: 2),
+            ),
+          );
+        }
+        return;
+      }
+
       final text = await OfflineAsrService.transcribe(path);
       if (!mounted) return;
       setState(() => _transcribing = false);
@@ -389,7 +451,13 @@ class _HomePageState extends State<HomePage> {
       return '正在下载语音模型 $pct%（仅需一次，之后完全离线）';
     }
     if (_transcribing) return '正在识别…';
-    if (_recording) return '正在聆听…松手结束';
+    if (_recording) {
+      // 收到音量事件但一直很小声：提醒靠近麦克风（比事后才说"没听到人声"更好）
+      if (_ampReceived && _level < 0.15) {
+        return '正在聆听…声音有点小，靠近麦克风说';
+      }
+      return '正在聆听…松手结束';
+    }
     if (_listening) {
       return _voiceText.isEmpty
           ? '正在聆听…说完停顿一下，或再点麦克风结束'
@@ -489,6 +557,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void dispose() {
     _speech.cancel(); // 页面销毁时结束识别会话
+    _ampSub?.cancel();
     _recorder.dispose();
     _holdTimer?.cancel();
     _textController.dispose();
@@ -833,6 +902,21 @@ class _HomePageState extends State<HomePage> {
                                   minHeight: 5,
                                   backgroundColor: Colors.white,
                                   color: Colors.blue,
+                                ),
+                              ),
+                            ],
+                            // 录音中的实时音量条
+                            if (_recording &&
+                                _ampReceived &&
+                                !_downloadingModel) ...[
+                              const SizedBox(height: 8),
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(3),
+                                child: LinearProgressIndicator(
+                                  value: _level,
+                                  minHeight: 5,
+                                  backgroundColor: Colors.white,
+                                  color: Colors.red.shade400,
                                 ),
                               ),
                             ],

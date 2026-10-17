@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
@@ -51,6 +52,14 @@ class _HomePageState extends State<HomePage> {
   // （TextField 的后缀区会被输入框的选中手势抢走，Tooltip 也会抢长按）
   Timer? _holdTimer;
   bool _pointerDown = false;
+  bool _holdConfirmed = false; // 已按住超过 350ms
+
+  // 录音前的检查结果缓存：避免每次长按都重新走平台调用，拖慢开录
+  bool _micPermissionChecked = false;
+  bool _micGranted = false;
+  bool _modelChecked = false;
+  bool _modelReady = false;
+  String? _tmpDir;
 
   bool _downloadingModel = false;
   double _modelProgress = 0;
@@ -100,43 +109,85 @@ class _HomePageState extends State<HomePage> {
 
   // ── 离线识别：长按说话 ───────────────────────────────
 
-  /// 长按麦克风 → 开始录音（先确保模型已下载）
-  Future<void> _startVoiceHold() async {
-    if (_isProcessing || _recording || _transcribing || _downloadingModel) {
+  /// 按下麦克风：立即开始录音，不等长按判定
+  ///
+  /// 录音启动本身有 100~200ms 延迟，若等 350ms 长按确认后再启动，
+  /// 开头一两个字必然被吃掉。所以按下即录，判定为短按再丢弃。
+  void _onMicPointerDown() {
+    if (_isProcessing || _transcribing || _downloadingModel || _recording) {
       return;
     }
+    _pointerDown = true;
+    _holdConfirmed = false;
+    _holdTimer?.cancel();
+    _holdTimer = Timer(const Duration(milliseconds: 350), () {
+      if (!_pointerDown) return;
+      HapticFeedback.mediumImpact();
+      if (mounted) setState(() => _holdConfirmed = true);
+    });
+    unawaited(_beginRecording());
+  }
 
-    // 1. 麦克风权限（点按才请求，不在启动时打扰）
-    var perm = await Permission.microphone.status;
-    if (perm.isDenied) perm = await Permission.microphone.request();
-    if (!perm.isGranted) {
-      if (perm.isPermanentlyDenied) openAppSettings();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('需要麦克风权限才能语音输入，请在设置中允许'),
-            duration: Duration(seconds: 3),
-          ),
-        );
+  /// 抬手：长按成立 → 结束录音并识别；短按 → 当作误触丢弃
+  void _onMicPointerUp() {
+    _pointerDown = false;
+    _holdTimer?.cancel();
+    if (!_holdConfirmed) {
+      _discardRecording();
+      return;
+    }
+    _stopVoiceHold();
+  }
+
+  /// 权限 + 模型检查通过后开录
+  Future<void> _beginRecording() async {
+    // 1. 麦克风权限：授权过就不再走平台查询（省 20~50ms）
+    if (!_micPermissionChecked) {
+      var perm = await Permission.microphone.status;
+      if (perm.isDenied) perm = await Permission.microphone.request();
+      _micPermissionChecked = true;
+      _micGranted = perm.isGranted;
+      if (!_micGranted) {
+        if (perm.isPermanentlyDenied) openAppSettings();
+        _pointerDown = false;
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('需要麦克风权限才能语音输入，请在设置中允许'),
+              duration: Duration(seconds: 3),
+            ),
+          );
+        }
+        return;
       }
+    }
+    if (!_micGranted) return;
+
+    // 2. 模型状态只在第一次查（之后用缓存）
+    if (!_modelChecked) {
+      _modelReady = await AsrModelManager.isReady();
+      _modelChecked = true;
+    }
+    if (!_modelReady) {
+      if (!mounted) return;
+      _pointerDown = false;
+      await _promptDownloadModel();
       return;
     }
 
-    // 2. 模型没装就引导下载（只需一次，之后完全离线）
-    if (!await AsrModelManager.isReady()) {
-      if (!mounted) return;
-      await _promptDownloadModel();
-      if (!mounted) return;
-      if (!await AsrModelManager.isReady()) return;
-    }
-
-    // 3. 录音：16k 单声道 WAV，识别引擎直接吃这个格式
-    // 若在权限弹窗/下载对话框期间已经抬手，就不要开始录了
+    // 权限弹窗/下载对话框期间已经抬手 → 不录
     if (!_pointerDown) return;
+
+    // 边录边加载模型：识别器首次创建要 1~2 秒，正好和用户说话的时间重叠，
+    // 松手后基本能立刻出结果
+    unawaited(OfflineAsrService.ensureLoaded().catchError((_) {}));
+
+    // 3. 开录：16k 单声道 WAV
     try {
-      final dir = await getTemporaryDirectory();
+      final dirPath = _tmpDir ?? (await getTemporaryDirectory()).path;
+      _tmpDir = dirPath;
       _voiceFile =
-          '${dir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.wav';
+          '$dirPath/voice_${DateTime.now().millisecondsSinceEpoch}.wav';
       await _recorder.start(
         const RecordConfig(
           encoder: AudioEncoder.wav,
@@ -145,6 +196,11 @@ class _HomePageState extends State<HomePage> {
         ),
         path: _voiceFile!,
       );
+      // start() 期间抬手了：直接丢弃，别卡在录音态
+      if (!_pointerDown) {
+        await _discardRecording();
+        return;
+      }
       if (mounted) {
         setState(() {
           _recording = true;
@@ -159,6 +215,22 @@ class _HomePageState extends State<HomePage> {
         );
       }
     }
+  }
+
+  /// 短按误触：停掉录音并删掉临时文件
+  Future<void> _discardRecording() async {
+    if (!_recording && _voiceFile == null) return;
+    try {
+      await _recorder.stop();
+    } catch (_) {}
+    if (mounted) setState(() => _recording = false);
+    try {
+      if (_voiceFile != null) {
+        final f = File(_voiceFile!);
+        if (await f.exists()) await f.delete();
+      }
+    } catch (_) {}
+    _voiceFile = null;
   }
 
   /// 松手 → 结束录音 → 离线识别 → 回填输入框并解析
@@ -196,11 +268,17 @@ class _HomePageState extends State<HomePage> {
         return;
       }
 
-      // 回填输入框，让用户能看到"听到了什么"，再走解析
+      // 只回填输入框，不直接弹账单：识别可能听错，先让用户核对/修改，
+      // 确认后再点「AI 识别记账」按钮解析
       _textController.text = text;
       _textController.selection =
           TextSelection.collapsed(offset: text.length);
-      _sendToAI(text);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('已转成文字，确认无误后点「AI 识别记账」'),
+          duration: Duration(seconds: 3),
+        ),
+      );
     } catch (e, st) {
       ErrorReporter.report('voice_transcribe', e, st);
       if (mounted) {
@@ -282,6 +360,9 @@ class _HomePageState extends State<HomePage> {
       );
       if (!mounted) return;
       setState(() => _downloadingModel = false);
+      // 更新缓存，下次长按不再查文件系统
+      _modelChecked = true;
+      _modelReady = ok;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(ok ? '✅ 语音模型已就绪，长按麦克风试试' : '下载未完成，请重试'),
@@ -696,7 +777,9 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ),
                     // 语音状态条：录音中 / 识别中 / 下载模型中
-                    if (_recording || _transcribing || _listening ||
+                    if ((_recording && _holdConfirmed) ||
+                        _transcribing ||
+                        _listening ||
                         _downloadingModel) ...[
                       const SizedBox(height: 10),
                       Container(
@@ -832,24 +915,9 @@ class _HomePageState extends State<HomePage> {
 
     return Listener(
       behavior: HitTestBehavior.opaque,
-      onPointerDown: (_) {
-        if (busy) return;
-        _pointerDown = true;
-        _holdTimer?.cancel();
-        _holdTimer = Timer(const Duration(milliseconds: 350), () {
-          if (_pointerDown) _startVoiceHold();
-        });
-      },
-      onPointerUp: (_) {
-        _pointerDown = false;
-        _holdTimer?.cancel();
-        if (_recording) _stopVoiceHold();
-      },
-      onPointerCancel: (_) {
-        _pointerDown = false;
-        _holdTimer?.cancel();
-        if (_recording) _stopVoiceHold();
-      },
+      onPointerDown: (_) => _onMicPointerDown(),
+      onPointerUp: (_) => _onMicPointerUp(),
+      onPointerCancel: (_) => _onMicPointerUp(),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
         child: Icon(icon, size: 22, color: color),

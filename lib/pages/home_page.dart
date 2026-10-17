@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -45,6 +46,11 @@ class _HomePageState extends State<HomePage> {
   bool _recording = false;      // 长按录音中
   bool _transcribing = false;   // 离线识别中
   String? _voiceFile;           // 本次录音的临时 wav
+
+  // 长按判定：用 Listener 直接收原始触摸事件，不参与手势竞争
+  // （TextField 的后缀区会被输入框的选中手势抢走，Tooltip 也会抢长按）
+  Timer? _holdTimer;
+  bool _pointerDown = false;
 
   bool _downloadingModel = false;
   double _modelProgress = 0;
@@ -125,6 +131,8 @@ class _HomePageState extends State<HomePage> {
     }
 
     // 3. 录音：16k 单声道 WAV，识别引擎直接吃这个格式
+    // 若在权限弹窗/下载对话框期间已经抬手，就不要开始录了
+    if (!_pointerDown) return;
     try {
       final dir = await getTemporaryDirectory();
       _voiceFile =
@@ -401,6 +409,7 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     _speech.cancel(); // 页面销毁时结束识别会话
     _recorder.dispose();
+    _holdTimer?.cancel();
     _textController.dispose();
     _textFocus.dispose();
     super.dispose();
@@ -639,7 +648,7 @@ class _HomePageState extends State<HomePage> {
                     Icon(Icons.auto_awesome,
                         size: 48, color: Colors.blue.shade300),
                     const SizedBox(height: 12),
-                    Text('输入一句话，AI 自动记账',
+                    Text('输入一句话，或长按麦克风说话',
                         style:
                             TextStyle(fontSize: 15, color: Colors.grey.shade600)),
                     const SizedBox(height: 24),
@@ -668,31 +677,7 @@ class _HomePageState extends State<HomePage> {
                         suffixIcon: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            // 麦克风：长按说话、松手结束（微信式）
-                            GestureDetector(
-                              onLongPressStart: (_) => _startVoiceHold(),
-                              onLongPressEnd: (_) => _stopVoiceHold(),
-                              child: Tooltip(
-                                message: _recording ? '松手结束' : '长按说话',
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(
-                                      horizontal: 10, vertical: 10),
-                                  child: Icon(
-                                    _recording
-                                        ? Icons.mic
-                                        : (_transcribing
-                                            ? Icons.graphic_eq
-                                            : Icons.mic_none),
-                                    size: 22,
-                                    color: _recording
-                                        ? Colors.red
-                                        : (_transcribing
-                                            ? Colors.blue
-                                            : Colors.grey.shade600),
-                                  ),
-                                ),
-                              ),
-                            ),
+                            _buildMicButton(),
                             IconButton(
                               icon: const Icon(Icons.clear, size: 20),
                               onPressed: () {
@@ -828,6 +813,46 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 麦克风按钮：按下 350ms 判定为长按 → 开始录音，抬手结束
+  ///
+  /// 用 [Listener] 而不是 GestureDetector：TextField 的后缀区会被输入框的
+  /// 选中手势抢走长按，Tooltip 也会抢，只有原始指针事件不会被拦截。
+  Widget _buildMicButton() {
+    final busy = _isProcessing || _transcribing || _downloadingModel;
+    final color = _recording
+        ? Colors.red
+        : (busy ? Colors.grey.shade400 : Colors.grey.shade600);
+    final icon = _recording
+        ? Icons.mic
+        : (_transcribing ? Icons.graphic_eq : Icons.mic_none);
+
+    return Listener(
+      behavior: HitTestBehavior.opaque,
+      onPointerDown: (_) {
+        if (busy) return;
+        _pointerDown = true;
+        _holdTimer?.cancel();
+        _holdTimer = Timer(const Duration(milliseconds: 350), () {
+          if (_pointerDown) _startVoiceHold();
+        });
+      },
+      onPointerUp: (_) {
+        _pointerDown = false;
+        _holdTimer?.cancel();
+        if (_recording) _stopVoiceHold();
+      },
+      onPointerCancel: (_) {
+        _pointerDown = false;
+        _holdTimer?.cancel();
+        if (_recording) _stopVoiceHold();
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+        child: Icon(icon, size: 22, color: color),
       ),
     );
   }

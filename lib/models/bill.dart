@@ -97,28 +97,30 @@ class Bill {
       'Bill(id:$id, $type, $category, ¥$amount, $date, $remark)';
 }
 
-/// 账单分类及其显示信息
+/// 账单分类
+///
+/// 只保留数据（名称 + 显示名）。图标与配色属于展示层，
+/// 放在 `lib/theme/category_style.dart`，避免模型依赖 Flutter。
 class BillCategory {
   final String name;
-  final String icon;   // emoji 图标
-  final String label;  // 中文显示名
+  final String label; // 中文显示名
 
-  const BillCategory(this.name, this.icon, this.label);
+  const BillCategory(this.name, this.label);
 
   static const List<BillCategory> expenseCategories = [
-    BillCategory('餐饮', '🍜', '餐饮'),
-    BillCategory('交通', '🚗', '交通'),
-    BillCategory('购物', '🛒', '购物'),
-    BillCategory('娱乐', '🎮', '娱乐'),
-    BillCategory('居住', '🏠', '居住'),
-    BillCategory('人情', '🎁', '人情'),
-    BillCategory('医疗', '💊', '医疗'),
-    BillCategory('其他', '📌', '其他'),
+    BillCategory('餐饮', '餐饮'),
+    BillCategory('交通', '交通'),
+    BillCategory('购物', '购物'),
+    BillCategory('娱乐', '娱乐'),
+    BillCategory('居住', '居住'),
+    BillCategory('人情', '人情'),
+    BillCategory('医疗', '医疗'),
+    BillCategory('其他', '其他'),
   ];
 
   static const List<BillCategory> incomeCategories = [
-    BillCategory('薪资', '💰', '薪资'),
-    BillCategory('其他', '📌', '其他'),
+    BillCategory('薪资', '薪资'),
+    BillCategory('其他', '其他'),
   ];
 
   /// 获取所有分类（支出 + 收入）
@@ -132,17 +134,13 @@ class BillCategory {
     return all;
   }
 
-  /// 根据名称查找图标
-  static String iconFor(String categoryName) {
-    for (final c in allCategories) {
-      if (c.name == categoryName) return c.icon;
-    }
-    return '📌';
-  }
-
   /// 获取所有分类名称列表
   static List<String> get categoryNames =>
       allCategories.map((c) => c.name).toList();
+
+  /// 获取某类型下的分类列表
+  static List<BillCategory> forType(String type) =>
+      type == '收入' ? incomeCategories : expenseCategories;
 
   /// 各分类的子分类（手动页/确认弹窗 chips 来源，与解析词表保持一致）
   static const Map<String, List<String>> subcategories = {

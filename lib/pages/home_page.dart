@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
@@ -9,20 +10,26 @@ import 'package:speech_to_text/speech_to_text.dart';
 // 7.5.0 主入口未导出这两个类型，从包内公开子库导入
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
+
 import '../models/bill.dart';
 import '../services/api_service.dart';
-import '../services/asr_model.dart';
-import '../services/bill_import.dart';
+import '../services/app_events.dart';
+import '../services/asr_model_controller.dart';
 import '../services/database_service.dart';
 import '../services/error_reporter.dart';
 import '../services/haptics.dart';
 import '../services/offline_asr_service.dart';
 import '../services/voice_activity.dart';
+import '../theme/app_theme.dart';
+import '../widgets/app_widgets.dart';
 import '../widgets/bill_edit_sheet.dart';
-import 'bill_list_page.dart';
 import 'manual_entry_page.dart';
 
-/// 文字输入主页
+/// 记账首页
+///
+/// 信息层级：本月概览 → 一句话输入（主操作）→ 语音/手动两个次级入口
+/// → 最近记账。麦克风从输入框的 suffixIcon 里拿出来做成独立按钮，
+/// 因为"长按说话"是隐藏交互，藏在图标里没人会发现。
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -33,61 +40,92 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final _textController = TextEditingController();
   final _textFocus = FocusNode();
+
   bool _isProcessing = false;
-  bool _serverAvailable = false;
-  bool _serverChecked = false;
+
+  // 本月概览
+  double _monthExpense = 0;
+  double _monthIncome = 0;
   List<Bill> _recentBills = [];
 
-  // ── 语音输入（离线识别为主，系统识别兜底） ─────────────
+  // ── 语音 ─────────────────────────────────────────────
   final SpeechToText _speech = SpeechToText();
-  bool _speechReady = false; // 系统语音识别是否可用（华为上需实测）
-  bool _listening = false;   // 系统识别中
+  bool _speechReady = false;
+  bool _listening = false;
   String _voiceText = '';
 
   final AudioRecorder _recorder = AudioRecorder();
-  bool _recording = false;      // 长按录音中
-  bool _transcribing = false;   // 离线识别中
-  String? _voiceFile;           // 本次录音的临时 wav
+  bool _recording = false;
+  bool _transcribing = false;
+  String? _voiceFile;
 
-  // 录音期间的实时音量（让用户看到麦克风确实在收音，太小声也有提示）
   StreamSubscription<Amplitude>? _ampSub;
-  double _level = 0;          // 归一化到 0~1
-  bool _ampReceived = false;  // 是否收到过音量事件（部分机型不支持）
+  double _level = 0;
+  bool _ampReceived = false;
 
   // 长按判定：用 Listener 直接收原始触摸事件，不参与手势竞争
-  // （TextField 的后缀区会被输入框的选中手势抢走，Tooltip 也会抢长按）
   Timer? _holdTimer;
   bool _pointerDown = false;
-  bool _holdConfirmed = false; // 已按住超过 350ms
+  bool _holdConfirmed = false;
 
-  // 录音前的检查结果缓存：避免每次长按都重新走平台调用，拖慢开录
+  // 录音前的检查结果缓存，避免每次长按都走平台调用
   bool _micPermissionChecked = false;
   bool _micGranted = false;
-  bool _modelChecked = false;
-  bool _modelReady = false;
   String? _tmpDir;
 
-  bool _downloadingModel = false;
-  double _modelProgress = 0;
+  final _model = AsrModelController.instance;
 
   @override
   void initState() {
     super.initState();
-    _loadRecentBills();
-    _checkServer();
+    _model.addListener(_onModelChanged);
+    _loadOverview();
+    AppEvents.instance.addListener(_onBillsChanged);
   }
 
-  Future<void> _checkServer() async {
-    final ok = await ApiService.checkHealth();
-    if (mounted) setState(() { _serverAvailable = ok; _serverChecked = true; });
+  @override
+  void dispose() {
+    AppEvents.instance.removeListener(_onBillsChanged);
+    _model.removeListener(_onModelChanged);
+    _speech.cancel();
+    _ampSub?.cancel();
+    _recorder.dispose();
+    _holdTimer?.cancel();
+    _textController.dispose();
+    _textFocus.dispose();
+    super.dispose();
+  }
+
+  void _onModelChanged() {
+    if (mounted) setState(() {});
+  }
+
+  void _onBillsChanged() {
+    if (mounted) _loadOverview();
+  }
+
+  Future<void> _loadOverview() async {
+    try {
+      final now = DateTime.now();
+      final ym = DateFormat('yyyy-MM').format(now);
+      final summary = await DatabaseService.instance.getMonthlySummary(ym);
+      final recent = await DatabaseService.instance.getRecentBills(limit: 4);
+      if (!mounted) return;
+      setState(() {
+        _monthExpense = summary['支出'] ?? 0;
+        _monthIncome = summary['收入'] ?? 0;
+        _recentBills = recent;
+      });
+    } catch (_) {
+      // 首次使用数据库还没建好，忽略
+    }
   }
 
   // ── 语音输入 ─────────────────────────────────────────
 
-  /// 初始化系统语音识别；华为无谷歌服务，能否用取决于系统/输入法提供的识别服务
   Future<bool> _ensureSpeech() async {
     if (_speechReady) return true;
-    bool available = false;
+    bool available;
     try {
       available = await _speech.initialize(onError: _onSpeechError);
     } catch (_) {
@@ -100,27 +138,19 @@ class _HomePageState extends State<HomePage> {
   void _onSpeechError(SpeechRecognitionError error) {
     if (!mounted) return;
     if (_listening) setState(() => _listening = false);
-    // 没听到内容或超时：静默结束
     if (error.errorMsg == 'error_no_match' ||
         error.errorMsg == 'error_speech_timeout') {
       return;
     }
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('语音识别出错: ${error.errorMsg}'),
-        duration: const Duration(seconds: 3),
-      ),
-    );
+    showAppSnack(context, '语音识别出错：${error.errorMsg}', kind: SnackKind.error);
   }
 
-  // ── 离线识别：长按说话 ───────────────────────────────
-
-  /// 按下麦克风：立即开始录音，不等长按判定
+  /// 按下麦克风：立即开录，不等长按判定
   ///
-  /// 录音启动本身有 100~200ms 延迟，若等 350ms 长按确认后再启动，
+  /// 录音启动有 100~200ms 延迟，等 350ms 长按确认后再开录，
   /// 开头一两个字必然被吃掉。所以按下即录，判定为短按再丢弃。
   void _onMicPointerDown() {
-    if (_isProcessing || _transcribing || _downloadingModel || _recording) {
+    if (_isProcessing || _transcribing || _model.downloading || _recording) {
       return;
     }
     _pointerDown = true;
@@ -128,15 +158,12 @@ class _HomePageState extends State<HomePage> {
     _holdTimer?.cancel();
     _holdTimer = Timer(const Duration(milliseconds: 350), () {
       if (!_pointerDown) return;
-      // 走原生振动器：Flutter 的 HapticFeedback 在部分华为/鸿蒙机型上被
-      // 系统触感开关静默吞掉，长按完全没反馈
       unawaited(Haptics.tap());
       if (mounted) setState(() => _holdConfirmed = true);
     });
     unawaited(_beginRecording());
   }
 
-  /// 抬手：长按成立 → 结束录音并识别；短按 → 当作误触丢弃
   void _onMicPointerUp() {
     _pointerDown = false;
     _holdTimer?.cancel();
@@ -147,9 +174,8 @@ class _HomePageState extends State<HomePage> {
     _stopVoiceHold();
   }
 
-  /// 权限 + 模型检查通过后开录
   Future<void> _beginRecording() async {
-    // 1. 麦克风权限：授权过就不再走平台查询（省 20~50ms）
+    // 1. 麦克风权限（授权过就不再走平台查询）
     if (!_micPermissionChecked) {
       var perm = await Permission.microphone.status;
       if (perm.isDenied) perm = await Permission.microphone.request();
@@ -159,24 +185,16 @@ class _HomePageState extends State<HomePage> {
         if (perm.isPermanentlyDenied) openAppSettings();
         _pointerDown = false;
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('需要麦克风权限才能语音输入，请在设置中允许'),
-              duration: Duration(seconds: 3),
-            ),
-          );
+          showAppSnack(context, '需要麦克风权限才能语音输入', kind: SnackKind.error);
         }
         return;
       }
     }
     if (!_micGranted) return;
 
-    // 2. 模型状态只在第一次查（之后用缓存）
-    if (!_modelChecked) {
-      _modelReady = await AsrModelManager.isReady();
-      _modelChecked = true;
-    }
-    if (!_modelReady) {
+    // 2. 模型是否就绪
+    final ready = await _model.ensureChecked();
+    if (!ready) {
       if (!mounted) return;
       _pointerDown = false;
       await _promptDownloadModel();
@@ -186,11 +204,9 @@ class _HomePageState extends State<HomePage> {
     // 权限弹窗/下载对话框期间已经抬手 → 不录
     if (!_pointerDown) return;
 
-    // 边录边加载模型：识别器首次创建要 1~2 秒，正好和用户说话的时间重叠，
-    // 松手后基本能立刻出结果
+    // 边录边加载模型：首次创建识别器要 1~2 秒，正好和说话时间重叠
     unawaited(OfflineAsrService.ensureLoaded().catchError((_) {}));
 
-    // 3. 开录：16k 单声道 WAV
     try {
       final dirPath = _tmpDir ?? (await getTemporaryDirectory()).path;
       _tmpDir = dirPath;
@@ -204,7 +220,6 @@ class _HomePageState extends State<HomePage> {
         ),
         path: _voiceFile!,
       );
-      // start() 期间抬手了：直接丢弃，别卡在录音态
       if (!_pointerDown) {
         await _discardRecording();
         return;
@@ -219,14 +234,11 @@ class _HomePageState extends State<HomePage> {
     } catch (e, st) {
       ErrorReporter.report('voice_record_start', e, st);
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('录音启动失败: $e')),
-        );
+        showAppSnack(context, '录音启动失败：$e', kind: SnackKind.error);
       }
     }
   }
 
-  /// 短按误触：停掉录音并删掉临时文件
   Future<void> _discardRecording() async {
     if (!_recording && _voiceFile == null) return;
     _stopLevelMeter();
@@ -235,15 +247,12 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {}
     if (mounted) setState(() => _recording = false);
     try {
-      if (_voiceFile != null) {
-        final f = File(_voiceFile!);
-        if (await f.exists()) await f.delete();
-      }
+      final f = _voiceFile == null ? null : File(_voiceFile!);
+      if (f != null && await f.exists()) await f.delete();
     } catch (_) {}
     _voiceFile = null;
   }
 
-  /// 录音期间监听音量，驱动状态条上的音量条
   void _startLevelMeter() {
     _ampSub?.cancel();
     _ampReceived = false;
@@ -252,14 +261,11 @@ class _HomePageState extends State<HomePage> {
         .onAmplitudeChanged(const Duration(milliseconds: 120))
         .listen((amp) {
       if (!mounted) return;
-      // amp.current 是 dBFS（约 -160 ~ 0），-50dB 以下当静音
       final norm = ((amp.current + 50) / 50).clamp(0.0, 1.0);
       _ampReceived = true;
-      // 变化不到 4% 不刷新，避免高频 setState
       if ((norm - _level).abs() < 0.04) return;
       setState(() => _level = norm);
     }, onError: (_) {
-      // 个别机型拿不到实时音量：不显示音量条即可，不影响录音
       _ampReceived = false;
     });
   }
@@ -271,7 +277,7 @@ class _HomePageState extends State<HomePage> {
     _level = 0;
   }
 
-  /// 松手 → 结束录音 → 离线识别 → 回填输入框并解析
+  /// 松手 → 结束录音 → 人声检测 → 离线识别 → 回填输入框
   Future<void> _stopVoiceHold() async {
     if (!_recording) return;
     _stopLevelMeter();
@@ -293,25 +299,13 @@ class _HomePageState extends State<HomePage> {
     }
 
     try {
-      // 先判断这段录音里到底有没有人声。
-      // 纯静音/环境噪声喂给 Paraformer 不会返回空串，而是"脑补"出一段
-      // 莫名其妙的话（幻听），所以在这里直接拦掉，不浪费一次推理。
+      // 纯静音/环境噪声喂给 Paraformer 不会返回空串，而是"脑补"一段话，
+      // 所以先做一次能量检测，没人声就直接拦掉、不浪费一次推理
       final activity = await VoiceDetector.analyzeFile(path);
       if (activity != null && !activity.hasSpeech) {
-        debugPrint('[VAD] 未检测到人声 '
-            'dur=${activity.durationSec.toStringAsFixed(2)}s '
-            'peak=${activity.peakDbfs.toStringAsFixed(1)}dB '
-            'noise=${activity.noiseDbfs.toStringAsFixed(1)}dB '
-            'thr=${activity.thresholdDbfs.toStringAsFixed(1)}dB '
-            'voiced=${(activity.voicedRatio * 100).toStringAsFixed(1)}%');
         if (mounted) {
           setState(() => _transcribing = false);
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(activity.hint),
-              duration: const Duration(seconds: 2),
-            ),
-          );
+          showAppSnack(context, activity.hint);
         }
         return;
       }
@@ -321,39 +315,22 @@ class _HomePageState extends State<HomePage> {
       setState(() => _transcribing = false);
 
       if (text.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('没听清，长按麦克风再说一次'),
-            duration: Duration(seconds: 2),
-          ),
-        );
+        showAppSnack(context, '没听清，长按麦克风再说一次');
         return;
       }
 
-      // 只回填输入框，不直接弹账单：识别可能听错，先让用户核对/修改，
-      // 确认后再点「AI 识别记账」按钮解析
+      // 只回填输入框，不直接弹账单：识别可能听错，先让用户核对
       _textController.text = text;
-      _textController.selection =
-          TextSelection.collapsed(offset: text.length);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('已转成文字，确认无误后点「AI 识别记账」'),
-          duration: Duration(seconds: 3),
-        ),
-      );
+      _textController.selection = TextSelection.collapsed(offset: text.length);
+      showAppSnack(context, '已转成文字，确认后点「AI 识别记账」',
+          kind: SnackKind.success);
     } catch (e, st) {
       ErrorReporter.report('voice_transcribe', e, st);
       if (mounted) {
         setState(() => _transcribing = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('识别失败: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
+        showAppSnack(context, '识别失败：$e', kind: SnackKind.error);
       }
     } finally {
-      // 临时录音文件用完即删，避免堆积
       try {
         final f = File(path);
         if (await f.exists()) await f.delete();
@@ -361,9 +338,9 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// 模型未就绪时的引导：下载 / 先用系统识别 / 取消
+  /// 模型未就绪时的引导
   Future<void> _promptDownloadModel() async {
-    final model = AsrModel.defaultModel;
+    final model = _model.model;
     final choice = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -381,10 +358,11 @@ class _HomePageState extends State<HomePage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, 'system'),
-            child: const Text('先用系统识别'),
+            child: const Text('用系统识别'),
           ),
           ElevatedButton(
             onPressed: () => Navigator.pop(ctx, 'download'),
+            style: ElevatedButton.styleFrom(minimumSize: const Size(88, 42)),
             child: const Text('下载'),
           ),
         ],
@@ -393,112 +371,40 @@ class _HomePageState extends State<HomePage> {
 
     if (!mounted) return;
     if (choice == 'download') {
-      await _downloadModel();
+      final ok = await _model.download();
+      if (!mounted) return;
+      showAppSnack(
+        context,
+        ok ? '模型已就绪，长按麦克风试试' : '下载未完成，请检查网络后重试',
+        kind: ok ? SnackKind.success : SnackKind.error,
+      );
     } else if (choice == 'system') {
-      await _toggleVoice();
+      await _toggleSystemVoice();
     }
   }
 
-  /// 下载模型，进度显示在页面顶部状态条里
-  Future<void> _downloadModel() async {
-    if (_downloadingModel) return;
-    setState(() {
-      _downloadingModel = true;
-      _modelProgress = 0;
-    });
-
-    try {
-      var lastShown = 0.0;
-      final ok = await AsrModelManager.download(
-        onProgress: (received, total) {
-          if (!mounted || total <= 0) return;
-          final p = received / total;
-          // 每 1% 才刷新一次，避免频繁 setState
-          if (p - lastShown >= 0.01 || p >= 1) {
-            lastShown = p;
-            setState(() => _modelProgress = p);
-          }
-        },
-      );
-      if (!mounted) return;
-      setState(() => _downloadingModel = false);
-      // 更新缓存，下次长按不再查文件系统
-      _modelChecked = true;
-      _modelReady = ok;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(ok ? '✅ 语音模型已就绪，长按麦克风试试' : '下载未完成，请重试'),
-          duration: const Duration(seconds: 3),
-        ),
-      );
-    } catch (e, st) {
-      ErrorReporter.report('asr_model_download', e, st);
-      if (!mounted) return;
-      setState(() => _downloadingModel = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('模型下载失败: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
-    }
-  }
-
-  /// 语音状态条文案
-  String _voiceStatusText() {
-    if (_downloadingModel) {
-      final pct = (_modelProgress * 100).toStringAsFixed(0);
-      return '正在下载语音模型 $pct%（仅需一次，之后完全离线）';
-    }
-    if (_transcribing) return '正在识别…';
-    if (_recording) {
-      // 收到音量事件但一直很小声：提醒靠近麦克风（比事后才说"没听到人声"更好）
-      if (_ampReceived && _level < 0.15) {
-        return '正在聆听…声音有点小，靠近麦克风说';
-      }
-      return '正在聆听…松手结束';
-    }
+  /// 系统识别（仅在模型未下载时作为兜底）
+  Future<void> _toggleSystemVoice() async {
     if (_listening) {
-      return _voiceText.isEmpty
-          ? '正在聆听…说完停顿一下，或再点麦克风结束'
-          : _voiceText;
-    }
-    return '';
-  }
-
-  /// 点麦克风开始/停止听写（系统识别，仅在模型未下载时作为兜底）
-  Future<void> _toggleVoice() async {
-    if (_listening) {
-      await _speech.stop(); // stop 会触发 finalResult
+      await _speech.stop();
       return;
     }
     if (_isProcessing) return;
 
-    // 1. 麦克风权限（点按才请求，不在启动时打扰）
     var perm = await Permission.microphone.status;
     if (perm.isDenied) perm = await Permission.microphone.request();
     if (!perm.isGranted) {
       if (perm.isPermanentlyDenied) openAppSettings();
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('需要麦克风权限才能语音输入，请在设置中允许'),
-            duration: Duration(seconds: 3),
-          ),
-        );
+        showAppSnack(context, '需要麦克风权限才能语音输入', kind: SnackKind.error);
       }
       return;
     }
 
-    // 2. 初始化系统识别（华为上取决于是否装了带识别服务的输入法）
     if (!await _ensureSpeech()) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('系统语音识别不可用：请安装"讯飞输入法"后重试（它自带系统识别服务）'),
-            duration: Duration(seconds: 4),
-          ),
-        );
+        showAppSnack(context, '系统语音识别不可用：华为设备可先安装"讯飞输入法"',
+            kind: SnackKind.error);
       }
       return;
     }
@@ -513,30 +419,21 @@ class _HomePageState extends State<HomePage> {
           partialResults: true,
           cancelOnError: true,
           listenFor: const Duration(seconds: 20),
-          pauseFor: const Duration(seconds: 2), // 停顿 2 秒自动结束
+          pauseFor: const Duration(seconds: 2),
           localeId: 'zh_CN',
           listenMode: ListenMode.dictation,
         ),
       );
-      // 识别服务未真正启动（无异常但未在听）
       if (mounted && !_speech.isListening && _listening) {
         setState(() => _listening = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('语音识别不可用：华为设备可尝试安装讯飞输入法（自带系统识别服务）后重试'),
-            duration: Duration(seconds: 3),
-          ),
-        );
+        showAppSnack(context, '语音识别不可用：可尝试安装讯飞输入法后重试',
+            kind: SnackKind.error);
       }
     } catch (_) {
       if (mounted) {
         setState(() => _listening = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('语音识别不可用：华为设备可尝试安装讯飞输入法（自带系统识别服务）后重试'),
-            duration: Duration(seconds: 3),
-          ),
-        );
+        showAppSnack(context, '语音识别不可用：可尝试安装讯飞输入法后重试',
+            kind: SnackKind.error);
       }
     }
   }
@@ -549,158 +446,51 @@ class _HomePageState extends State<HomePage> {
     setState(() => _listening = false);
     final text = result.recognizedWords.trim();
     if (text.isEmpty) return;
-    // 识别完成 → 填入输入框并自动识别记账（确认弹窗里可改）
     _textController.text = text;
     _sendToAI(text);
   }
 
-  @override
-  void dispose() {
-    _speech.cancel(); // 页面销毁时结束识别会话
-    _ampSub?.cancel();
-    _recorder.dispose();
-    _holdTimer?.cancel();
-    _textController.dispose();
-    _textFocus.dispose();
-    super.dispose();
-  }
-
-  Future<void> _loadRecentBills() async {
-    try {
-      final bills = await DatabaseService.instance.getRecentBills();
-      if (mounted) setState(() => _recentBills = bills);
-    } on Exception {
-      // 首次使用，数据库未初始化
-    }
-  }
-
-  Future<void> _importBills() async {
-    // 需要连接 PC 后端（WiFi 环境）
-    if (_isProcessing) return;
-    setState(() => _isProcessing = true);
-
-    try {
-      final bills = await ApiService.fetchImportBills();
-      if (!mounted) return;
-
-      if (bills == null || bills.isEmpty) {
-        setState(() => _isProcessing = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('未获取到账单数据（需连接 WiFi 后端）')),
-        );
-        return;
-      }
-
-      // 增量导入：按内容指纹逐条去重，库里已有的跳过、只插入新账单，
-      // 可反复导入而不产生重复
-      final existing = await DatabaseService.instance.getExistingFingerprints();
-      if (!mounted) return;
-
-      final plan = planImport(bills, existing);
-
-      if (plan.isEmpty) {
-        setState(() => _isProcessing = false);
-        _loadRecentBills();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('这 ${bills.length} 条账单已全部存在，无需重复导入'),
-          ),
-        );
-        return;
-      }
-
-      final count = await DatabaseService.instance.bulkInsertBills(plan.fresh);
-      if (!mounted) return;
-      setState(() => _isProcessing = false);
-      _loadRecentBills();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            plan.duplicated > 0
-                ? '✅ 新增 $count 条，跳过 ${plan.duplicated} 条重复'
-                : '✅ 成功导入 $count 条历史账单',
-          ),
-        ),
-      );
-    } catch (e, st) {
-      if (mounted) {
-        setState(() => _isProcessing = false);
-        // 上报到电脑端（/api/log），排查真机错误
-        ErrorReporter.report('import', e, st);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('导入失败，错误已上报电脑')),
-        );
-        // 弹出完整错误详情，方便截图/复制
-        showDialog<void>(
-          context: context,
-          builder: (_) => AlertDialog(
-            title: const Text('导入失败'),
-            content: SingleChildScrollView(
-              child: SelectableText(e.toString()),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('关闭'),
-              ),
-            ],
-          ),
-        );
-      }
-    }
-  }
-
-  // ── AI 分析 ────────────────────────────────────────────
+  // ── AI 解析 ───────────────────────────────────────────
 
   Future<void> _sendToAI(String text) async {
-    if (text.trim().isEmpty) return;
+    final input = text.trim();
+    if (input.isEmpty) {
+      showAppSnack(context, '先说一句话，比如「中午吃饭花了25」');
+      _textFocus.requestFocus();
+      return;
+    }
 
     setState(() => _isProcessing = true);
-
     try {
-      final bill = await ApiService.extractBill(text);
+      final bill = await ApiService.extractBill(input);
       if (!mounted) return;
       setState(() => _isProcessing = false);
-      _serverAvailable = ApiService.lastUsedRemote;
-      // 提示当前使用的解析模式
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            ApiService.lastUsedRemote ? '✅ AI 云端解析完成' : '📱 本地引擎解析完成',
-          ),
-          duration: const Duration(seconds: 2),
-          behavior: SnackBarBehavior.floating,
-          width: 240,
-        ),
+      showAppSnack(
+        context,
+        ApiService.lastUsedRemote ? '已用云端 AI 解析' : '已用本地引擎解析（离线）',
+        kind: SnackKind.success,
       );
-      _showConfirmSheet(bill);
+      _showConfirmSheet(bill, sourceText: input);
     } catch (e) {
-      if (mounted) {
-        setState(() => _isProcessing = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('解析出错: $e')),
-        );
-      }
+      if (!mounted) return;
+      setState(() => _isProcessing = false);
+      showAppSnack(context, '解析出错：$e', kind: SnackKind.error);
     }
   }
 
-  // ── 确认/手动 ─────────────────────────────────────────
-
-  void _showConfirmSheet(Bill bill) {
+  void _showConfirmSheet(Bill bill, {String? sourceText}) {
     showBillEditSheet(
       context: context,
       bill: bill,
       title: '确认记账',
       saveLabel: '确认保存',
-      onSave: (editedBill) async {
-        await DatabaseService.instance.insertBill(editedBill);
+      sourceText: sourceText,
+      onSave: (edited) async {
+        await DatabaseService.instance.insertBill(edited);
         _textController.clear();
-        _loadRecentBills();
+        AppEvents.instance.billsChanged();
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-                content: Text('✅ 记账成功！'), duration: Duration(seconds: 1)),
-          );
+          showAppSnack(context, '已记一笔', kind: SnackKind.success);
         }
       },
     );
@@ -712,13 +502,8 @@ class _HomePageState extends State<HomePage> {
       MaterialPageRoute(builder: (_) => const ManualEntryPage()),
     );
     if (saved == true) {
-      _loadRecentBills();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-              content: Text('✅ 记账成功！'), duration: Duration(seconds: 1)),
-        );
-      }
+      AppEvents.instance.billsChanged();
+      if (mounted) showAppSnack(context, '已记一笔', kind: SnackKind.success);
     }
   }
 
@@ -728,321 +513,401 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('AI 记账'),
-        centerTitle: true,
+        title: const Text('记账'),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.download),
-            tooltip: '导入历史账单',
-            onPressed: _importBills,
-          ),
-          IconButton(
-            icon: const Icon(Icons.receipt_long),
-            tooltip: '账单列表',
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const BillListPage()),
-              ).then((_) => _loadRecentBills());
-            },
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          // ── 引擎状态指示条 ──────────────────────────
-          if (_serverChecked)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-              color: _serverAvailable
-                  ? Colors.green.shade50
-                  : Colors.orange.shade50,
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    _serverAvailable ? Icons.cloud_done : Icons.phone_android,
-                    size: 14,
-                    color: _serverAvailable
-                        ? Colors.green.shade700
-                        : Colors.orange.shade700,
-                  ),
-                  const SizedBox(width: 6),
-                  Text(
-                    _serverAvailable ? 'WiFi AI 引擎 · 云端解析' : '本地引擎 · 离线工作',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: _serverAvailable
-                          ? Colors.green.shade700
-                          : Colors.orange.shade700,
-                    ),
-                  ),
-                  const Spacer(),
-                  GestureDetector(
-                    onTap: _checkServer,
-                    child: Icon(Icons.refresh, size: 14,
-                        color: Colors.grey.shade500),
-                  ),
-                ],
-              ),
-            ),
-          if (_recentBills.isNotEmpty) _buildRecentBills(),
-          Expanded(
-            child: SingleChildScrollView(
-              child: Padding(
-                padding: const EdgeInsets.all(24),
-                child: Column(
-                  children: [
-                    const SizedBox(height: 20),
-                    Icon(Icons.auto_awesome,
-                        size: 48, color: Colors.blue.shade300),
-                    const SizedBox(height: 12),
-                    Text('输入一句话，或长按麦克风说话',
-                        style:
-                            TextStyle(fontSize: 15, color: Colors.grey.shade600)),
-                    const SizedBox(height: 24),
-
-                    // 输入框
-                    TextField(
-                      controller: _textController,
-                      focusNode: _textFocus,
-                      maxLines: 2,
-                      textInputAction: TextInputAction.send,
-                      onSubmitted: (text) => _sendToAI(text),
-                      decoration: InputDecoration(
-                        hintText: '例如：今天中午吃黄焖鸡花了25元',
-                        hintStyle: TextStyle(color: Colors.grey.shade400),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(14),
-                          borderSide:
-                              BorderSide(color: Colors.blue.shade200),
-                        ),
-                        focusedBorder: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(14),
-                          borderSide: BorderSide(
-                              color: Colors.blue.shade400, width: 2),
-                        ),
-                        prefixIcon: const Icon(Icons.edit_note),
-                        suffixIcon: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            _buildMicButton(),
-                            IconButton(
-                              icon: const Icon(Icons.clear, size: 20),
-                              onPressed: () {
-                                _textController.clear();
-                                // 使用 postFrameCallback 避免构建期间 setState
-                                WidgetsBinding.instance
-                                    .addPostFrameCallback((_) {
-                                  if (mounted) setState(() {});
-                                });
-                              },
-                            ),
-                          ],
-                        ),
-                        contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 16, vertical: 14),
-                      ),
-                    ),
-                    // 语音状态条：录音中 / 识别中 / 下载模型中
-                    if ((_recording && _holdConfirmed) ||
-                        _transcribing ||
-                        _listening ||
-                        _downloadingModel) ...[
-                      const SizedBox(height: 10),
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 12, vertical: 10),
-                        decoration: BoxDecoration(
-                          color: _downloadingModel
-                              ? Colors.blue.shade50
-                              : Colors.red.shade50,
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Icon(
-                                  _downloadingModel
-                                      ? Icons.cloud_download
-                                      : (_transcribing
-                                          ? Icons.graphic_eq
-                                          : Icons.mic),
-                                  size: 16,
-                                  color: _downloadingModel
-                                      ? Colors.blue.shade700
-                                      : Colors.red,
-                                ),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: Text(
-                                    _voiceStatusText(),
-                                    style: TextStyle(
-                                      fontSize: 13,
-                                      color: _downloadingModel
-                                          ? Colors.blue.shade700
-                                          : Colors.red.shade700,
-                                    ),
-                                    maxLines: 2,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                              ],
-                            ),
-                            if (_downloadingModel) ...[
-                              const SizedBox(height: 8),
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(3),
-                                child: LinearProgressIndicator(
-                                  value: _modelProgress,
-                                  minHeight: 5,
-                                  backgroundColor: Colors.white,
-                                  color: Colors.blue,
-                                ),
-                              ),
-                            ],
-                            // 录音中的实时音量条
-                            if (_recording &&
-                                _ampReceived &&
-                                !_downloadingModel) ...[
-                              const SizedBox(height: 8),
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(3),
-                                child: LinearProgressIndicator(
-                                  value: _level,
-                                  minHeight: 5,
-                                  backgroundColor: Colors.white,
-                                  color: Colors.red.shade400,
-                                ),
-                              ),
-                            ],
-                          ],
-                        ),
-                      ),
-                    ],
-                    const SizedBox(height: 16),
-
-                    // AI 识别按钮
-                    SizedBox(
-                      width: double.infinity,
-                      height: 52,
-                      child: ElevatedButton.icon(
-                        icon: _isProcessing
-                            ? const SizedBox(
-                                width: 20,
-                                height: 20,
-                                child: CircularProgressIndicator(
-                                    strokeWidth: 2, color: Colors.white),
-                              )
-                            : const Icon(Icons.auto_awesome),
-                        label: Text(
-                            _isProcessing ? 'AI 分析中…' : 'AI 识别记账',
-                            style: const TextStyle(fontSize: 16)),
-                        onPressed: _isProcessing
-                            ? null
-                            : () => _sendToAI(_textController.text),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.blue,
-                          foregroundColor: Colors.white,
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-
-                    // 手动记账按钮 — 直接填写表单，无需 AI 解析
-                    SizedBox(
-                      width: double.infinity,
-                      height: 52,
-                      child: OutlinedButton.icon(
-                        icon: const Icon(Icons.edit_note),
-                        label: const Text('手动记账',
-                            style: TextStyle(fontSize: 16)),
-                        onPressed: _isProcessing ? null : _openManualEntry,
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: Colors.blue,
-                          side: BorderSide(color: Colors.blue.shade300),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
+          Padding(
+            padding: const EdgeInsets.only(right: AppGap.lg),
+            child: Center(
+              child: Text(
+                DateFormat('M月d日 EEEE', 'zh_CN').format(DateTime.now()),
+                style: TextStyle(
+                  fontSize: 12.5,
+                  color: context.palette.textTertiary,
                 ),
               ),
             ),
           ),
         ],
       ),
-    );
-  }
-
-  /// 麦克风按钮：按下 350ms 判定为长按 → 开始录音，抬手结束
-  ///
-  /// 用 [Listener] 而不是 GestureDetector：TextField 的后缀区会被输入框的
-  /// 选中手势抢走长按，Tooltip 也会抢，只有原始指针事件不会被拦截。
-  Widget _buildMicButton() {
-    final busy = _isProcessing || _transcribing || _downloadingModel;
-    final color = _recording
-        ? Colors.red
-        : (busy ? Colors.grey.shade400 : Colors.grey.shade600);
-    final icon = _recording
-        ? Icons.mic
-        : (_transcribing ? Icons.graphic_eq : Icons.mic_none);
-
-    return Listener(
-      behavior: HitTestBehavior.opaque,
-      onPointerDown: (_) => _onMicPointerDown(),
-      onPointerUp: (_) => _onMicPointerUp(),
-      onPointerCancel: (_) => _onMicPointerUp(),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-        child: Icon(icon, size: 22, color: color),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(
+            AppGap.lg, AppGap.sm, AppGap.lg, AppGap.xxl),
+        children: [
+          _buildOverviewCard(),
+          const SizedBox(height: AppGap.lg),
+          _buildInputCard(),
+          const SizedBox(height: AppGap.md),
+          _buildSecondaryActions(),
+          _buildVoiceStatus(),
+          const SizedBox(height: AppGap.xxl),
+          SectionTitle(
+            title: '最近记账',
+            actionLabel: _recentBills.isEmpty ? null : '全部',
+            onAction: () => AppEvents.instance.switchTab(1),
+          ),
+          _buildRecentCard(),
+        ],
       ),
     );
   }
 
-  Widget _buildRecentBills() {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      color: Colors.blue.shade50,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text('最近记账',
-              style: TextStyle(fontSize: 13, color: Colors.blueGrey)),
-          const SizedBox(height: 4),
-          SizedBox(
-            height: 36,
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              itemCount: _recentBills.length,
-              separatorBuilder: (ctx2, i2) => const SizedBox(width: 8),
-              itemBuilder: (ctx, i) {
-                final b = _recentBills[i];
-                return Chip(
-                  avatar: Text(BillCategory.iconFor(b.category)),
-                  label: Text(
-                    '${b.isExpense ? "-" : "+"}¥${b.amount.toStringAsFixed(2)}',
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                      color: b.isExpense ? Colors.red : Colors.green,
-                    ),
+  /// 本月概览：让首页一眼看到"这个月花了多少"
+  Widget _buildOverviewCard() {
+    final monthLabel = DateFormat('M月').format(DateTime.now());
+    final balance = _monthIncome - _monthExpense;
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(AppRadius.xl),
+      child: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF3A55E0), Color(0xFF6C86FF)],
+          ),
+        ),
+        child: Stack(
+          children: [
+            // 右上角一枚很淡的装饰圆，避免大色块显得死板
+            Positioned(
+              right: -30,
+              top: -40,
+              child: Container(
+                width: 140,
+                height: 140,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: Colors.white.withValues(alpha: 0.07),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(
+                  AppGap.xl, AppGap.lg, AppGap.xl, AppGap.lg),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '$monthLabel支出',
+                    style: const TextStyle(
+                        fontSize: 13, color: Color(0xCCFFFFFF)),
                   ),
-                  backgroundColor: Colors.white,
-                );
-              },
+                  const SizedBox(height: 6),
+                  Text(
+                    '¥${formatMoney(_monthExpense)}',
+                    style: moneyStyle(
+                        size: 34, color: Colors.white, letterSpacing: -0.8),
+                  ),
+                  const SizedBox(height: AppGap.lg),
+                  Row(
+                    children: [
+                      _miniStat('收入', _monthIncome),
+                      const SizedBox(width: AppGap.xl),
+                      _miniStat('结余', balance),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _miniStat(String label, double value) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(label,
+            style: const TextStyle(fontSize: 12.5, color: Color(0xB3FFFFFF))),
+        const SizedBox(width: 6),
+        Text(
+          '¥${formatMoney(value)}',
+          style: moneyStyle(
+              size: 14, color: Colors.white, weight: FontWeight.w600),
+        ),
+      ],
+    );
+  }
+
+  /// 一句话输入卡（主操作区）
+  Widget _buildInputCard() {
+    final palette = context.palette;
+
+    return AppCard(
+      padding: const EdgeInsets.all(AppGap.lg),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 26,
+                height: 26,
+                decoration: BoxDecoration(
+                  color: palette.brandSoft,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Icon(Icons.auto_awesome_rounded,
+                    size: 15, color: Theme.of(context).colorScheme.primary),
+              ),
+              const SizedBox(width: AppGap.sm),
+              Text(
+                '一句话记账',
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: Theme.of(context).colorScheme.onSurface,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: AppGap.md),
+          TextField(
+            controller: _textController,
+            focusNode: _textFocus,
+            minLines: 2,
+            maxLines: 4,
+            textInputAction: TextInputAction.send,
+            onSubmitted: _sendToAI,
+            style: const TextStyle(fontSize: 16, height: 1.45),
+            decoration: InputDecoration(
+              hintText: '例如：今天中午吃黄焖鸡花了25元',
+              hintStyle: TextStyle(fontSize: 15, color: palette.textTertiary),
+              suffixIcon: _textController.text.isEmpty
+                  ? null
+                  : IconButton(
+                      onPressed: () {
+                        _textController.clear();
+                        setState(() {});
+                      },
+                      icon: Icon(Icons.close_rounded,
+                          size: 18, color: palette.textTertiary),
+                    ),
+            ),
+            onChanged: (_) => setState(() {}),
+          ),
+          const SizedBox(height: AppGap.md),
+          SizedBox(
+            height: 50,
+            child: ElevatedButton.icon(
+              icon: _isProcessing
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: Colors.white),
+                    )
+                  : const Icon(Icons.auto_awesome_rounded, size: 19),
+              label: Text(_isProcessing ? '解析中…' : 'AI 识别记账'),
+              onPressed:
+                  _isProcessing ? null : () => _sendToAI(_textController.text),
             ),
           ),
+        ],
+      ),
+    );
+  }
+
+  /// 两个次级入口：长按说话 / 手动填写
+  Widget _buildSecondaryActions() {
+    final busy = _isProcessing || _transcribing || _model.downloading;
+
+    return Row(
+      children: [
+        Expanded(child: _buildMicButton(busy)),
+        const SizedBox(width: AppGap.md),
+        Expanded(child: _buildManualButton(busy)),
+      ],
+    );
+  }
+
+  /// 麦克风：明确的按钮形态 + 文字说明，按住变红提示"松手结束"
+  Widget _buildMicButton(bool busy) {
+    final palette = context.palette;
+    final active = _recording && _holdConfirmed;
+    final accent = palette.expense;
+
+    return Listener(
+      behavior: HitTestBehavior.opaque,
+      onPointerDown: busy ? null : (_) => _onMicPointerDown(),
+      onPointerUp: busy ? null : (_) => _onMicPointerUp(),
+      onPointerCancel: busy ? null : (_) => _onMicPointerUp(),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 140),
+        height: 52,
+        decoration: BoxDecoration(
+          color: active
+              ? palette.expenseSoft
+              : Theme.of(context).colorScheme.surface,
+          borderRadius: BorderRadius.circular(AppRadius.md),
+          border: Border.all(
+            color: active ? accent : palette.hairline,
+            width: active ? 1.4 : 1,
+          ),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  active ? Icons.graphic_eq_rounded : Icons.mic_none_rounded,
+                  size: 19,
+                  color: active ? accent : palette.textSecondary,
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  active ? '松手结束' : '长按说话',
+                  style: TextStyle(
+                    fontSize: 14.5,
+                    fontWeight: FontWeight.w600,
+                    color: active ? accent : palette.textSecondary,
+                  ),
+                ),
+              ],
+            ),
+            if (active && _ampReceived) ...[
+              const SizedBox(height: 6),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(2),
+                  child: LinearProgressIndicator(
+                    value: _level,
+                    minHeight: 3,
+                    backgroundColor: accent.withValues(alpha: 0.18),
+                    color: accent,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildManualButton(bool busy) {
+    final palette = context.palette;
+    return SizedBox(
+      height: 52,
+      child: OutlinedButton.icon(
+        icon: Icon(Icons.edit_note_rounded,
+            size: 20, color: palette.textSecondary),
+        label: Text(
+          '手动填写',
+          style: TextStyle(
+            fontSize: 14.5,
+            fontWeight: FontWeight.w600,
+            color: palette.textSecondary,
+          ),
+        ),
+        onPressed: busy ? null : _openManualEntry,
+        style: OutlinedButton.styleFrom(
+          backgroundColor: Theme.of(context).colorScheme.surface,
+          side: BorderSide(color: palette.hairline),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(AppRadius.md),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 语音/下载状态条（录音中的反馈在麦克风按钮上）
+  Widget _buildVoiceStatus() {
+    final palette = context.palette;
+
+    String? text;
+    double? progress;
+    if (_model.downloading) {
+      text = '正在下载语音模型 ${(_model.progress * 100).toStringAsFixed(0)}%';
+      progress = _model.progress;
+    } else if (_transcribing) {
+      text = '正在识别…';
+    } else if (_listening) {
+      text = _voiceText.isEmpty ? '正在聆听…说完停顿一下' : _voiceText;
+    }
+
+    if (text == null) return const SizedBox.shrink();
+
+    return Padding(
+      padding: const EdgeInsets.only(top: AppGap.md),
+      child: Container(
+        padding: const EdgeInsets.all(AppGap.md),
+        decoration: BoxDecoration(
+          color: palette.surfaceAlt,
+          borderRadius: BorderRadius.circular(AppRadius.md),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    value: progress,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                ),
+                const SizedBox(width: AppGap.sm),
+                Expanded(
+                  child: Text(
+                    text,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style:
+                        TextStyle(fontSize: 13, color: palette.textSecondary),
+                  ),
+                ),
+              ],
+            ),
+            if (progress != null) ...[
+              const SizedBox(height: AppGap.sm),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(3),
+                child: LinearProgressIndicator(value: progress),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRecentCard() {
+    if (_recentBills.isEmpty) {
+      return const AppCard(
+        padding: EdgeInsets.zero,
+        child: EmptyState(
+          icon: Icons.receipt_long_rounded,
+          title: '还没有账单',
+          subtitle: '在上面说一句「中午吃饭花了25」，\n剩下的交给 AI。',
+        ),
+      );
+    }
+
+    final palette = context.palette;
+    return AppCard(
+      padding: EdgeInsets.zero,
+      child: Column(
+        children: [
+          for (var i = 0; i < _recentBills.length; i++) ...[
+            if (i > 0)
+              Divider(
+                height: 1,
+                thickness: 1,
+                indent: 60,
+                color: palette.hairline,
+              ),
+            BillTile(bill: _recentBills[i]),
+          ],
         ],
       ),
     );

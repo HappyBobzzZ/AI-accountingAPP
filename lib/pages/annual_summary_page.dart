@@ -1,7 +1,13 @@
 import 'package:flutter/material.dart';
-import '../services/database_service.dart';
 
-/// 年度汇总页面
+import '../models/bill.dart';
+import '../services/app_events.dart';
+import '../services/database_service.dart';
+import '../theme/app_theme.dart';
+import '../theme/category_style.dart';
+import '../widgets/app_widgets.dart';
+
+/// 统计页 —— 年度总览 + 月度收支 + 支出分类占比
 class AnnualSummaryPage extends StatefulWidget {
   const AnnualSummaryPage({super.key});
 
@@ -12,229 +18,427 @@ class AnnualSummaryPage extends StatefulWidget {
 class _AnnualSummaryPageState extends State<AnnualSummaryPage> {
   int _year = DateTime.now().year;
   Map<String, dynamic>? _data;
+  List<Bill> _bills = [];
   bool _loading = true;
 
   @override
   void initState() {
     super.initState();
+    AppEvents.instance.addListener(_onBillsChanged);
     _load();
+  }
+
+  @override
+  void dispose() {
+    AppEvents.instance.removeListener(_onBillsChanged);
+    super.dispose();
+  }
+
+  void _onBillsChanged() {
+    if (mounted) _load();
   }
 
   Future<void> _load() async {
     setState(() => _loading = true);
-    final data = await DatabaseService.instance.getYearlySummary(_year);
-    if (mounted) setState(() { _data = data; _loading = false; });
+    try {
+      final data = await DatabaseService.instance.getYearlySummary(_year);
+      final bills = await DatabaseService.instance.getBillsByYear(_year);
+      if (!mounted) return;
+      setState(() {
+        _data = data;
+        _bills = bills;
+        _loading = false;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _loading = false);
+    }
   }
 
-  void _prevYear() => setState(() { _year--; _load(); });
-  void _nextYear() => setState(() { _year++; _load(); });
+  bool get _isCurrentYear => _year == DateTime.now().year;
+
+  void _shiftYear(int delta) {
+    setState(() => _year += delta);
+    _load();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final isCurrentYear = _year == DateTime.now().year;
-
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('年度汇总'),
-      ),
+      appBar: AppBar(title: const Text('统计')),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
-          : _data == null
-              ? const Center(child: Text('暂无数据'))
-              : _buildContent(isCurrentYear),
+          : ListView(
+              padding: const EdgeInsets.fromLTRB(
+                  AppGap.lg, AppGap.sm, AppGap.lg, AppGap.xxl),
+              children: [
+                _buildOverviewCard(),
+                const SizedBox(height: AppGap.md),
+                Center(
+                  child: PeriodSelector(
+                    label: '$_year 年',
+                    onPrev: () => _shiftYear(-1),
+                    onNext: _isCurrentYear ? null : () => _shiftYear(1),
+                  ),
+                ),
+                const SizedBox(height: AppGap.xl),
+                _buildMonthlySection(),
+                const SizedBox(height: AppGap.xl),
+                _buildCategorySection(),
+              ],
+            ),
     );
   }
 
-  Widget _buildContent(bool isCurrentYear) {
-    final totalIncome = (_data!['totalIncome'] as double?) ?? 0;
-    final totalExpense = (_data!['totalExpense'] as double?) ?? 0;
-    final balance = (_data!['balance'] as double?) ?? 0;
-    final monthly = (_data!['monthly'] as Map<int, Map<String, double>>?) ?? {};
+  Widget _buildOverviewCard() {
+    final income = (_data?['totalIncome'] as double?) ?? 0;
+    final expense = (_data?['totalExpense'] as double?) ?? 0;
+    final balance = income - expense;
 
-    // 找出最大值用于条形图比例
-    double maxVal = 0;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(AppRadius.xl),
+      child: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF3A55E0), Color(0xFF6C86FF)],
+          ),
+        ),
+        child: Stack(
+          children: [
+            Positioned(
+              right: -30,
+              top: -40,
+              child: Container(
+                width: 140,
+                height: 140,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: Colors.white.withValues(alpha: 0.07),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(
+                  AppGap.xl, AppGap.lg, AppGap.xl, AppGap.lg),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '$_year 年总支出',
+                    style: const TextStyle(
+                        fontSize: 13, color: Color(0xCCFFFFFF)),
+                  ),
+                  const SizedBox(height: 6),
+                  FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      '¥${formatMoney(expense)}',
+                      style: moneyStyle(
+                          size: 32, color: Colors.white, letterSpacing: -0.8),
+                    ),
+                  ),
+                  const SizedBox(height: AppGap.lg),
+                  Row(
+                    children: [
+                      _miniStat('总收入', income),
+                      const SizedBox(width: AppGap.xl),
+                      _miniStat('结余', balance),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _miniStat(String label, double value) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(label,
+            style: const TextStyle(fontSize: 12.5, color: Color(0xB3FFFFFF))),
+        const SizedBox(width: 6),
+        Text(
+          '¥${formatMoney(value)}',
+          style: moneyStyle(
+              size: 14, color: Colors.white, weight: FontWeight.w600),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildMonthlySection() {
+    final monthly =
+        (_data?['monthly'] as Map<int, Map<String, double>>?) ?? {};
+    final palette = context.palette;
+
+    var maxVal = 0.0;
     for (final m in monthly.values) {
-      final v = (m['支出'] ?? 0) + (m['收入'] ?? 0);
+      final v = m['支出'] ?? 0;
       if (v > maxVal) maxVal = v;
     }
-    if (maxVal == 0) maxVal = 1;
+    if (maxVal <= 0) maxVal = 1;
 
     return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // ── 年度总览卡片 ───────────────────────────────
-        _buildOverviewCard(totalIncome, totalExpense, balance),
-
-        // ── 年份切换 ───────────────────────────────────
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              IconButton(icon: const Icon(Icons.chevron_left), onPressed: _prevYear),
-              Text('$_year 年',
-                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
-              IconButton(
-                icon: const Icon(Icons.chevron_right),
-                onPressed: isCurrentYear ? null : _nextYear,
-              ),
-            ],
-          ),
-        ),
-
-        // ── 月明细标题 ─────────────────────────────────
-        const Padding(
-          padding: EdgeInsets.fromLTRB(16, 8, 16, 4),
+          padding: const EdgeInsets.only(left: 4, bottom: AppGap.sm),
           child: Row(
             children: [
-              Icon(Icons.bar_chart, size: 18, color: Colors.blueGrey),
-              SizedBox(width: 6),
-              Text('月度明细', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500)),
-            ],
-          ),
-        ),
-        const Divider(),
-
-        // ── 月度条形图 ─────────────────────────────────
-        Expanded(
-          child: ListView.builder(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            itemCount: 12,
-            itemBuilder: (ctx, i) {
-              final month = i + 1;
-              final data = monthly[month] ?? {'收入': 0.0, '支出': 0.0};
-              final income = data['收入'] ?? 0;
-              final expense = data['支出'] ?? 0;
-              final total = income + expense;
-              final hasData = total > 0;
-
-              return Padding(
-                padding: const EdgeInsets.symmetric(vertical: 3),
-                child: Row(
-                  children: [
-                    // 月份标签
-                    SizedBox(
-                      width: 36,
-                      child: Text('$month月',
-                          style: TextStyle(fontSize: 13, color: Colors.grey.shade700)),
-                    ),
-
-                    // 条形图
-                    Expanded(
-                      child: hasData
-                          ? LayoutBuilder(builder: (ctx, constraints) {
-                              final maxW = constraints.maxWidth;
-                              final expenseW = (expense / maxVal) * maxW * 0.7;
-                              final incomeW = (income / maxVal) * maxW * 0.7;
-                              return Row(
-                                children: [
-                                  if (expenseW > 2)
-                                    Container(
-                                      height: 22,
-                                      width: expenseW,
-                                      decoration: BoxDecoration(
-                                        color: Colors.red.shade300,
-                                        borderRadius: BorderRadius.circular(4),
-                                      ),
-                                    ),
-                                  if (expenseW > 2 && incomeW > 2)
-                                    const SizedBox(width: 4),
-                                  if (incomeW > 2)
-                                    Container(
-                                      height: 22,
-                                      width: incomeW,
-                                      decoration: BoxDecoration(
-                                        color: Colors.green.shade300,
-                                        borderRadius: BorderRadius.circular(4),
-                                      ),
-                                    ),
-                                ],
-                              );
-                            })
-                          : Container(
-                              height: 22,
-                              decoration: BoxDecoration(
-                                color: Colors.grey.shade100,
-                                borderRadius: BorderRadius.circular(4),
-                              ),
-                            ),
-                    ),
-
-                    // 金额数字
-                    SizedBox(
-                      width: 80,
-                      child: hasData
-                          ? Column(
-                              crossAxisAlignment: CrossAxisAlignment.end,
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                if (expense > 0)
-                                  Text('支出 ¥${expense.toStringAsFixed(0)}',
-                                      style: TextStyle(fontSize: 11, color: Colors.red.shade400)),
-                                if (income > 0)
-                                  Text('收入 ¥${income.toStringAsFixed(0)}',
-                                      style: TextStyle(fontSize: 11, color: Colors.green.shade500)),
-                              ],
-                            )
-                          : Text('-',
-                              textAlign: TextAlign.right,
-                              style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
-                    ),
-                  ],
+              Text(
+                '月度支出',
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: Theme.of(context).colorScheme.onSurface,
                 ),
-              );
-            },
+              ),
+              const Spacer(),
+              _legendDot(palette.expense, '支出'),
+              const SizedBox(width: AppGap.md),
+              _legendDot(palette.income, '收入'),
+            ],
+          ),
+        ),
+        AppCard(
+          padding: const EdgeInsets.symmetric(
+              horizontal: AppGap.lg, vertical: AppGap.md),
+          child: Column(
+            children: [
+              for (var i = 0; i < 12; i++)
+                _buildMonthRow(
+                  month: i + 1,
+                  expense: monthly[i + 1]?['支出'] ?? 0,
+                  income: monthly[i + 1]?['收入'] ?? 0,
+                  maxVal: maxVal,
+                  isLast: i == 11,
+                ),
+            ],
           ),
         ),
       ],
     );
   }
 
-  Widget _buildOverviewCard(double income, double expense, double balance) {
-    return Container(
-      margin: const EdgeInsets.all(12),
-      padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
-      decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          colors: [Color(0xFF1B5E20), Color(0xFF4CAF50)],
+  Widget _legendDot(Color color, String label) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 7,
+          height: 7,
+          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
         ),
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: const [
-          BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 2)),
-        ],
-      ),
-      child: Column(
+        const SizedBox(width: 4),
+        Text(label,
+            style: TextStyle(
+                fontSize: 11.5, color: context.palette.textTertiary)),
+      ],
+    );
+  }
+
+  Widget _buildMonthRow({
+    required int month,
+    required double expense,
+    required double income,
+    required double maxVal,
+    required bool isLast,
+  }) {
+    final palette = context.palette;
+    final hasData = expense > 0 || income > 0;
+
+    return Padding(
+      padding: EdgeInsets.only(bottom: isLast ? 0 : AppGap.md),
+      child: Row(
         children: [
-          Text('$_year 年总览',
-              style: const TextStyle(color: Colors.white70, fontSize: 14)),
-          const SizedBox(height: 14),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceAround,
-            children: [
-              _buildStat('总收入', income, Colors.greenAccent.shade100),
-              Container(width: 1, height: 36, color: Colors.white30),
-              _buildStat('总支出', expense, Colors.redAccent.shade100),
-              Container(width: 1, height: 36, color: Colors.white30),
-              _buildStat('结余', balance.abs(),
-                  balance >= 0 ? Colors.white : Colors.redAccent.shade200,
-                  prefix: balance < 0 ? '-' : ''),
-            ],
+          SizedBox(
+            width: 34,
+            child: Text(
+              '$month月',
+              style: TextStyle(fontSize: 12, color: palette.textTertiary),
+            ),
+          ),
+          Expanded(
+            child: hasData
+                ? Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      _bar(expense / maxVal, palette.expense),
+                      if (income > 0) ...[
+                        const SizedBox(height: 3),
+                        _bar(income / maxVal, palette.income),
+                      ],
+                    ],
+                  )
+                : Container(
+                    height: 6,
+                    decoration: BoxDecoration(
+                      color: palette.surfaceAlt,
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                  ),
+          ),
+          const SizedBox(width: AppGap.md),
+          SizedBox(
+            width: 66,
+            child: Text(
+              hasData ? '¥${formatMoney(expense, decimals: 0)}' : '—',
+              textAlign: TextAlign.right,
+              style: TextStyle(
+                fontSize: 11.5,
+                color: hasData ? palette.textSecondary : palette.textTertiary,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+            ),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildStat(String label, double amount, Color color, {String prefix = ''}) {
-    return Flexible(
-      child: Column(
+  Widget _bar(double ratio, Color color) {
+    final clamped = ratio.clamp(0.0, 1.0);
+    return LayoutBuilder(builder: (context, constraints) {
+      return Container(
+        height: 6,
+        decoration: BoxDecoration(
+          color: context.palette.surfaceAlt,
+          borderRadius: BorderRadius.circular(3),
+        ),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: Container(
+            width: constraints.maxWidth * clamped,
+            height: 6,
+            decoration: BoxDecoration(
+              color: color,
+              borderRadius: BorderRadius.circular(3),
+            ),
+          ),
+        ),
+      );
+    });
+  }
+
+  Widget _buildCategorySection() {
+    final palette = context.palette;
+
+    final byCategory = <String, double>{};
+    for (final bill in _bills) {
+      if (!bill.isExpense) continue;
+      byCategory.update(bill.category, (v) => v + bill.amount,
+          ifAbsent: () => bill.amount);
+    }
+    final entries = byCategory.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    final total = entries.fold<double>(0, (sum, e) => sum + e.value);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(left: 4, bottom: AppGap.sm),
+          child: Text(
+            '支出分类',
+            style: TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w600,
+              color: Theme.of(context).colorScheme.onSurface,
+            ),
+          ),
+        ),
+        AppCard(
+          padding: const EdgeInsets.symmetric(
+              horizontal: AppGap.lg, vertical: AppGap.md),
+          child: entries.isEmpty
+              ? Padding(
+                  padding: const EdgeInsets.symmetric(vertical: AppGap.lg),
+                  child: Center(
+                    child: Text(
+                      '$_year 年还没有支出记录',
+                      style: TextStyle(
+                          fontSize: 13, color: palette.textTertiary),
+                    ),
+                  ),
+                )
+              : Column(
+                  children: [
+                    for (var i = 0; i < entries.length; i++)
+                      _buildCategoryRow(
+                        entries[i].key,
+                        entries[i].value,
+                        total,
+                        isLast: i == entries.length - 1,
+                      ),
+                  ],
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCategoryRow(String category, double amount, double total,
+      {bool isLast = false}) {
+    final palette = context.palette;
+    final ratio = total <= 0 ? 0.0 : amount / total;
+
+    return Padding(
+      padding: EdgeInsets.only(bottom: isLast ? 0 : AppGap.lg),
+      child: Row(
         children: [
-          Text(label, style: const TextStyle(color: Colors.white70, fontSize: 12)),
-          const SizedBox(height: 2),
-          FittedBox(
-            fit: BoxFit.scaleDown,
-            child: Text(
-              '$prefix¥${amount.toStringAsFixed(0)}',
-              style: TextStyle(color: color, fontSize: 18, fontWeight: FontWeight.bold),
+          CategoryIcon(category: category, size: 34),
+          const SizedBox(width: AppGap.md),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      category,
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                        color: Theme.of(context).colorScheme.onSurface,
+                      ),
+                    ),
+                    const Spacer(),
+                    Text(
+                      '¥${formatMoney(amount, decimals: 0)}',
+                      style: moneyStyle(
+                          size: 13.5,
+                          color: palette.textSecondary,
+                          weight: FontWeight.w600),
+                    ),
+                    const SizedBox(width: AppGap.sm),
+                    SizedBox(
+                      width: 34,
+                      child: Text(
+                        '${(ratio * 100).toStringAsFixed(0)}%',
+                        textAlign: TextAlign.right,
+                        style: TextStyle(
+                            fontSize: 11.5, color: palette.textTertiary),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(3),
+                  child: LinearProgressIndicator(
+                    value: ratio,
+                    minHeight: 5,
+                    backgroundColor: palette.surfaceAlt,
+                    color: CategoryStyle.iconColor(context, category),
+                  ),
+                ),
+              ],
             ),
           ),
         ],

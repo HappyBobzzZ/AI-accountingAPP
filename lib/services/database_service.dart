@@ -9,6 +9,13 @@ class DatabaseService {
   static DatabaseService? _instance;
   static Database? _database;
 
+  /// 正在进行的初始化。
+  ///
+  /// 底部导航四个页面同时存在，启动时会并发查库；没有这层保护，
+  /// 两次调用会各自走一遍 openDatabase → 建表语句冲突 → 落到
+  /// "打开失败就重建"分支，等于把用户账单删了。
+  static Future<Database>? _opening;
+
   DatabaseService._();
 
   static DatabaseService get instance {
@@ -17,8 +24,18 @@ class DatabaseService {
   }
 
   Future<Database> get database async {
-    _database ??= await _initDatabase();
-    return _database!;
+    final ready = _database;
+    if (ready != null) return ready;
+
+    _opening ??= _initDatabase();
+    try {
+      final db = await _opening!;
+      _database = db;
+      return db;
+    } catch (_) {
+      _opening = null;
+      rethrow;
+    }
   }
 
   Future<Database> _initDatabase() async {
@@ -56,12 +73,16 @@ class DatabaseService {
         },
       );
     } catch (e, st) {
-      // 打开失败：可能是残留的损坏数据库文件 → 删除后重建再试一次
+      // 打开失败：可能是残留的损坏数据库文件 → 先备份再重建
       ErrorReporter.report('db_open_first_attempt', e, st);
       try {
         final f = File(dbPath);
         if (await f.exists()) {
-          await f.delete();
+          // 不直接删：改名留档，万一是偶发错误还能手动救回账单
+          final stamp = DateTime.now()
+              .toIso8601String()
+              .replaceAll(RegExp(r'[:.]'), '-');
+          await f.rename('$dbPath.corrupt-$stamp');
         }
         // 同时清理 -journal / -wal 残留
         for (final suffix in ['-journal', '-wal', '-shm']) {
@@ -263,6 +284,18 @@ class DatabaseService {
     final results = await db.query(
       'bills',
       orderBy: 'date ASC, created_at ASC',
+    );
+    return results.map((row) => Bill.fromJson(row)).toList();
+  }
+
+  /// 获取某一年全部账单（统计页算分类占比用）
+  Future<List<Bill>> getBillsByYear(int year) async {
+    final db = await database;
+    final results = await db.query(
+      'bills',
+      where: 'date >= ? AND date <= ?',
+      whereArgs: ['$year-01-01', '$year-12-31'],
+      orderBy: 'date ASC',
     );
     return results.map((row) => Bill.fromJson(row)).toList();
   }

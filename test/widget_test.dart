@@ -9,16 +9,22 @@ void main() {
   sqfliteFfiInit();
   databaseFactory = databaseFactoryFfi;
 
-  testWidgets('App renders home page', (WidgetTester tester) async {
+  testWidgets('主界面渲染底部导航与首页主操作', (WidgetTester tester) async {
     await tester.pumpWidget(const MyApp());
+    await tester.pump();
 
-    // 验证首页 AppBar 标题存在
-    expect(find.text('AI 记账'), findsOneWidget);
+    // 首页主操作区
+    expect(find.text('一句话记账'), findsOneWidget);
+    expect(find.text('AI 识别记账'), findsOneWidget);
+    expect(find.text('长按说话'), findsOneWidget);
+    expect(find.text('手动填写'), findsOneWidget);
 
-    // 验证账单列表按钮存在
-    expect(find.byIcon(Icons.receipt_long), findsOneWidget);
+    // 底部导航四个标签（标签文字与页面标题会重复出现）
+    for (final label in ['记账', '账单', '统计', '设置']) {
+      expect(find.text(label), findsWidgets, reason: '缺少「$label」入口');
+    }
 
-    // 验证手动记账按钮存在
-    expect(find.text('手动记账'), findsOneWidget);
+    // 导航栏本身存在
+    expect(find.byType(NavigationBar), findsOneWidget);
   });
 }

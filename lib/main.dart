@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:intl/date_symbol_data_local.dart';
-import 'pages/home_page.dart';
+import 'pages/main_shell.dart';
+import 'theme/app_theme.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -37,14 +38,9 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'AI 记账',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorSchemeSeed: Colors.blue,
-        useMaterial3: true,
-        appBarTheme: const AppBarTheme(
-          centerTitle: true,
-          elevation: 0,
-        ),
-      ),
+      theme: AppTheme.light(),
+      darkTheme: AppTheme.dark(),
+      themeMode: ThemeMode.system,
       // 使用 GlobalMaterialLocalizations 提供更完整的本地化（鸿蒙兼容性更好）
       localizationsDelegates: const [
         GlobalMaterialLocalizations.delegate,
@@ -67,7 +63,7 @@ class MyApp extends StatelessWidget {
         }
         return supportedLocales.first;
       },
-      home: const HomePage(),
+      home: const MainShell(),
     );
   }
 }
